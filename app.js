@@ -98,10 +98,15 @@ let lastSpeedTime = 0;
 let lastSpeedBytes = 0;
 let currentSpeedBps = 0;
 
-// ==================== 协议收发封装（原生 raw 通道：文字走 JSON，分片走裸二进制） ====================
+// ==================== 协议收发封装（统一走原生 DataChannel，杜绝与 PeerJS 缓冲队列乱序） ====================
 function sendJson(conn, payload) {
   if (!conn || !conn.open) return;
-  conn.send(JSON.stringify(payload));
+  const text = JSON.stringify(payload);
+  if (conn.dataChannel && conn.dataChannel.readyState === "open") {
+    conn.dataChannel.send(text);
+  } else {
+    conn.send(text);
+  }
 }
 
 function parseControlMessage(data) {
@@ -122,19 +127,6 @@ function configureFastDataChannel(conn) {
       conn.dataChannel.bufferedAmountLowThreshold = APP_CONFIG.lowBufferedAmount;
     }
   } catch {}
-}
-
-// 动态获取当前通道安全支持的最大分片（64KB ~ 256KB）
-function getOptimalChunkSize(conn) {
-  try {
-    const maxMsg = conn?.peerConnection?.sctp?.maxMessageSize;
-    if (typeof maxMsg === "number" && maxMsg >= APP_CONFIG.defaultChunkSize) {
-      // 预留少量 SCTP 协议余量，按 16KB 对齐
-      const safeMax = Math.floor(Math.min(maxMsg, APP_CONFIG.maxChunkSize) / 16384) * 16384;
-      return Math.max(APP_CONFIG.defaultChunkSize, safeMax);
-    }
-  } catch {}
-  return APP_CONFIG.defaultChunkSize;
 }
 
 // 检测当前 WebRTC 实际走的线路（局域网直连 vs 跨公网/代理）
@@ -632,6 +624,8 @@ function handleSessionData(rawData) {
 
   if (data.type === "file-done" && currentRole === "sender") {
     const doneName = selectedFile ? selectedFile.name : "文件";
+    const doneSize = selectedFile ? selectedFile.size : 0;
+    updateProgress("已完成", doneSize, doneSize, true);
     clearTransferState(false);
     setStatus("ready", `对方已无损接收「${doneName}」！可继续发送其他文件`, true);
     showToast("对方已成功接收并保存文件！");
@@ -1082,7 +1076,11 @@ dropZone.addEventListener("keydown", (e) => {
   }
 });
 
-fileInput.addEventListener("change", (e) => handleFileSelected(e.target.files[0]));
+fileInput.addEventListener("change", (e) => {
+  handleFileSelected(e.target.files[0]);
+  // 清空 value，允许用户再次重选同一个文件
+  fileInput.value = "";
+});
 dropZone.addEventListener("dragover", (e) => {
   e.preventDefault();
   dropZone.classList.add("dragover");
