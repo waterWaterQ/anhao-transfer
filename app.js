@@ -120,7 +120,9 @@ let candidateStats = { host: 0, srflx: 0, prflx: 0, relay: 0 };
 let isTransferring = false;
 let currentTransferId = null;
 let pendingIncomingMeta = null;
+let receiveBlobs = [];       // 每满 4MB 合并为一个 Blob，避免上万个 ArrayBuffer 拖慢手机 GC
 let receiveChunks = [];
+let receiveChunkBytes = 0;
 let receivedBytes = 0;
 let transferStartTime = 0;
 let lastSpeedTime = 0;
@@ -397,7 +399,9 @@ function clearTransferState(hideProgress = false) {
   isTransferring = false;
   currentTransferId = null;
   pendingIncomingMeta = null;
+  receiveBlobs = [];
   receiveChunks = [];
+  receiveChunkBytes = 0;
   receivedBytes = 0;
   currentSpeedBps = 0;
   incomingBox.classList.add("hidden");
@@ -1092,7 +1096,7 @@ async function joinReceiverRoom() {
 
 // ==================== 文件分片高速流控发送（2MB 双缓冲 + 16KB 零拷贝） ====================
 
-function waitForBufferDrain() {
+function waitForBufferDrain(onTick) {
   return new Promise((resolve, reject) => {
     if (!isChannelOpen()) {
       reject(new Error("连接已断开"));
@@ -1134,10 +1138,13 @@ function waitForBufferDrain() {
     const fallbackTimer = setInterval(() => {
       if (!isChannelOpen()) {
         onClose();
-      } else if (dc.bufferedAmount <= APP_CONFIG.lowBufferedAmount) {
-        onLow();
+      } else {
+        if (onTick) onTick();
+        if (dc.bufferedAmount <= APP_CONFIG.lowBufferedAmount) {
+          onLow();
+        }
       }
-    }, 20);
+    }, 30);
   });
 }
 
@@ -1199,7 +1206,11 @@ async function startSendingFileChunks(transferId) {
         }
 
         if (dc.bufferedAmount > APP_CONFIG.maxBufferedAmount) {
-          await waitForBufferDrain();
+          await waitForBufferDrain(() => {
+            // 按真正离开本地网卡缓冲区的字节数平滑更新进度与真实网速
+            const realSent = Math.max(0, sentOffset - (dc ? dc.bufferedAmount : 0));
+            updateProgress("发送中", realSent, file.size);
+          });
         }
 
         const len = Math.min(chunkSize, batchBuffer.byteLength - pos);
@@ -1207,7 +1218,9 @@ async function startSendingFileChunks(transferId) {
         dc.send(chunkView);
 
         sentOffset += len;
-        updateProgress("发送中", sentOffset, file.size);
+        // 减去仍滞留在浏览器本地缓冲区的字节，彻底消除开头虚飙高速的假象
+        const realSent = Math.max(0, sentOffset - dc.bufferedAmount);
+        updateProgress("发送中", realSent, file.size);
       }
     }
 
@@ -1216,7 +1229,8 @@ async function startSendingFileChunks(transferId) {
       transferId,
       totalBytes: file.size,
     });
-    updateProgress("校验中", file.size, file.size, true);
+    const finalSent = Math.max(0, sentOffset - (dc ? dc.bufferedAmount : 0));
+    updateProgress("等待对方接收完成", finalSent, file.size, true);
   } catch (err) {
     if (isTransferring) {
       clearTransferState(true);
@@ -1256,11 +1270,23 @@ function triggerDownloadAndFreeMemory(chunks, fileName, mimeType) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
+// 接收端每攒满 4 MB 自动合并为一个 Blob，避免上万个小 ArrayBuffer 拖慢手机浏览器垃圾回收
+function compactReceiveChunksIfNeeded(force = false) {
+  if (receiveChunks.length === 0) return;
+  if (force || receiveChunkBytes >= 4 * 1024 * 1024) {
+    receiveBlobs.push(new Blob(receiveChunks));
+    receiveChunks = [];
+    receiveChunkBytes = 0;
+  }
+}
+
 function handleChannelMessage(rawData) {
   if (rawData instanceof ArrayBuffer || ArrayBuffer.isView(rawData)) {
     if (currentRole !== "receiver" || !isTransferring || !pendingIncomingMeta) return;
     receiveChunks.push(rawData);
+    receiveChunkBytes += rawData.byteLength;
     receivedBytes += rawData.byteLength;
+    compactReceiveChunksIfNeeded(false);
     updateProgress("接收中", receivedBytes, pendingIncomingMeta.size);
     return;
   }
@@ -1269,7 +1295,9 @@ function handleChannelMessage(rawData) {
     if (currentRole !== "receiver" || !isTransferring || !pendingIncomingMeta) return;
     rawData.arrayBuffer().then((buf) => {
       receiveChunks.push(buf);
+      receiveChunkBytes += buf.byteLength;
       receivedBytes += buf.byteLength;
+      compactReceiveChunksIfNeeded(false);
       updateProgress("接收中", receivedBytes, pendingIncomingMeta.size);
     });
     return;
@@ -1354,7 +1382,8 @@ function handleChannelMessage(rawData) {
     }
 
     updateProgress("已完成", expectedSize, expectedSize, true);
-    triggerDownloadAndFreeMemory(receiveChunks, fileName, fileMime);
+    compactReceiveChunksIfNeeded(true);
+    triggerDownloadAndFreeMemory(receiveBlobs, fileName, fileMime);
     clearTransferState(false);
 
     setStatus("ready", `文件「${fileName}」已无损接收并保存！可继续传输`, true);
@@ -1388,7 +1417,9 @@ acceptFileBtn.addEventListener("click", () => {
 
   isTransferring = true;
   clearIdleTimer();
+  receiveBlobs = [];
   receiveChunks = [];
+  receiveChunkBytes = 0;
   receivedBytes = 0;
   transferStartTime = performance.now();
   lastSpeedTime = transferStartTime;
