@@ -143,6 +143,7 @@ body {
 /* 状态条 */
 .status-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
@@ -155,7 +156,18 @@ body {
 }
 
 #status-text {
-  flex: 1;
+  flex: 1 1 200px;
+}
+
+.verify-badge {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--primary);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
 .status-dot {
@@ -452,6 +464,87 @@ body {
   font-size: 13px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
   z-index: 100;
+}
+
+/* 折叠高级诊断与 TURN 设置面板 */
+.advanced-panel {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.advanced-summary {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-sub);
+  cursor: pointer;
+  user-select: none;
+}
+
+.advanced-body {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.diag-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.diag-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.diag-log {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-sub);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.turn-config {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.turn-cred-row,
+.turn-policy-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.small-input,
+.small-select {
+  flex: 1 1 140px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  color: var(--text-main);
+  font-size: 12px;
+  outline: none;
+}
+
+.small-input:focus,
+.small-select:focus {
+  border-color: var(--primary);
 }
 
 .hidden {

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>暗号快传 · 国内点对点免网盘文件传输</title>
-  <link rel="stylesheet" href="style.css?v=10" />
+  <link rel="stylesheet" href="style.css?v=11" />
 </head>
 <body>
   <div class="page">
@@ -38,6 +38,7 @@
       <div id="status-bar" class="status-bar status-idle">
         <span class="status-dot"></span>
         <span id="status-text">未连接：请创建暗号房间或输入对方暗号</span>
+        <span id="verify-badge" class="verify-badge hidden" title="由双方 WebRTC 加密证书指纹实时导出，核对一致即确保无中间人"></span>
         <button id="btn-disconnect" class="btn btn-small hidden" type="button">断开</button>
       </div>
 
@@ -162,6 +163,44 @@
           <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
         </div>
       </div>
+
+      <!-- 折叠抽屉：连接阶段诊断 + 自带 TURN 高级设置（零成本开源标配） -->
+      <details class="advanced-panel">
+        <summary class="advanced-summary">⚙️ 连接诊断与自带 TURN 设置（可选）</summary>
+        <div class="advanced-body">
+          <!-- 分阶段耗时与候选诊断 -->
+          <div class="diag-header">
+            <span class="diag-title">🔍 本次连接阶段诊断</span>
+            <button id="btn-copy-diag" class="btn btn-small" type="button">复制诊断</button>
+          </div>
+          <pre id="diag-log" class="diag-log">尚未发起连接</pre>
+
+          <!-- 自带 TURN 配置入口（仅存在本地浏览器） -->
+          <div class="turn-config">
+            <p class="diag-title">🔁 自带 TURN 中转配置（留空则纯 P2P 直连）</p>
+            <input
+              id="turn-urls-input"
+              class="small-input"
+              type="text"
+              placeholder="例如：turn:your-domain.com:3478 或 turns:your-domain.com:443?transport=tcp"
+              autocomplete="off"
+            />
+            <div class="turn-cred-row">
+              <input id="turn-user-input" class="small-input" type="text" placeholder="用户名（可选）" autocomplete="off" />
+              <input id="turn-pass-input" class="small-input" type="password" placeholder="凭据/密码（可选）" autocomplete="off" />
+            </div>
+            <div class="turn-policy-row">
+              <label class="hint" for="ice-policy-select">选路策略：</label>
+              <select id="ice-policy-select" class="small-select">
+                <option value="all">自动优先直连（all，推荐）</option>
+                <option value="relay">仅走 TURN 中继测试（relay）</option>
+              </select>
+              <button id="btn-save-turn" class="btn btn-small" type="button">保存</button>
+              <button id="btn-clear-turn" class="btn btn-small" type="button">清空</button>
+            </div>
+          </div>
+        </div>
+      </details>
     </main>
 
     <!-- 底部开源与隐私须知 -->
@@ -176,7 +215,7 @@
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <!-- 纯国内零第三方依赖信令与原生 WebRTC 传输引擎 -->
-  <script src="signal.js?v=10"></script>
-  <script src="app.js?v=10"></script>
+  <script src="signal.js?v=11"></script>
+  <script src="app.js?v=11"></script>
 </body>
 </html>
