@@ -7,8 +7,10 @@ const APP_CONFIG = {
   minCodeLength: 4,
   connectTimeoutMs: 15000, // 15 秒连接超时保护
   idleTimeoutMs: 5 * 60 * 1000, // 5 分钟空闲自动断开保护
-  chunkSize: 64 * 1024, // 64 KB 分片大小
-  maxBufferedAmount: 1024 * 1024, // 1 MB 发送缓冲区背压阈值
+  readBatchSize: 2 * 1024 * 1024, // 每次从硬盘批量预读 2 MB，大幅减少异步 I/O 次数
+  chunkSize: 64 * 1024, // 64 KB 分片发送，兼容所有主流浏览器 WebRTC 限制
+  maxBufferedAmount: 4 * 1024 * 1024, // 4 MB 发送缓冲区上限（兼顾高吞吐与内存安全）
+  lowBufferedAmount: 1 * 1024 * 1024, // 降到 1 MB 时立刻唤醒继续发送
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -83,8 +85,25 @@ let currentTransferId = null;
 let pendingIncomingMeta = null;
 let receiveChunks = [];
 let receivedBytes = 0;
-let transferStartTime = 0;
-let lastSpeedUpdate = 0;
+let lastSpeedTime = 0;
+let lastSpeedBytes = 0;
+let currentSpeedBps = 0;
+
+// ==================== 协议收发封装（原生 raw 通道：文字走 JSON，分片走裸二进制） ====================
+function sendJson(conn, payload) {
+  if (!conn || !conn.open) return;
+  conn.send(JSON.stringify(payload));
+}
+
+function parseControlMessage(data) {
+  if (typeof data !== "string") return null;
+  try {
+    const parsed = JSON.parse(data);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 // ==================== 工具函数 ====================
 
@@ -152,19 +171,23 @@ function showToast(message) {
   }, 3000);
 }
 
-// 更新进度条显示
+// 更新进度条与实时滑动网速
 function updateProgress(label, transferred, total, force = false) {
   const now = performance.now();
-  if (!force && now - lastSpeedUpdate < 100 && transferred < total) return;
-  lastSpeedUpdate = now;
+  const deltaMs = now - lastSpeedTime;
+  if (!force && deltaMs < 150 && transferred < total) return;
+
+  if (deltaMs >= 150) {
+    const deltaBytes = Math.max(0, transferred - lastSpeedBytes);
+    currentSpeedBps = (deltaBytes / deltaMs) * 1000;
+    lastSpeedTime = now;
+    lastSpeedBytes = transferred;
+  }
 
   const percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 100;
-  const elapsedSec = Math.max((now - transferStartTime) / 1000, 0.05);
-  const speed = transferred / elapsedSec;
-
   progressBox.classList.remove("hidden");
   progressLabel.textContent = `${label} ${percent}%（${formatBytes(transferred)} / ${formatBytes(total)}）`;
-  progressSpeed.textContent = formatSpeed(speed);
+  progressSpeed.textContent = formatSpeed(currentSpeedBps);
   progressFill.style.width = `${percent}%`;
 }
 
@@ -175,6 +198,7 @@ function clearTransferState(hideProgress = false) {
   pendingIncomingMeta = null;
   receiveChunks = [];
   receivedBytes = 0;
+  currentSpeedBps = 0;
   incomingBox.classList.add("hidden");
   if (hideProgress) {
     progressBox.classList.add("hidden");
@@ -195,9 +219,7 @@ function resetIdleTimer() {
 
   idleTimer = setTimeout(() => {
     if (activeConn && activeConn.open && !isTransferring) {
-      try {
-        activeConn.send({ type: "idle-timeout" });
-      } catch {}
+      sendJson(activeConn, { type: "idle-timeout" });
       setTimeout(() => {
         resetSession("已连续 5 分钟无传输操作，自动断开以保护安全");
         showToast("长时间无传输，已自动断开");
@@ -263,9 +285,9 @@ function ensurePeerJsLoaded() {
   return true;
 }
 
-// ==================== 阶段 3：发送端文件分片 + 背压流控 ====================
+// ==================== 高速文件发送：原生 raw 通道 + 2 MB 批量预读 + 事件驱动背压 ====================
 
-// 等待发送缓冲区水位降低，防止大文件发送撑爆内存
+// 事件驱动等待缓冲区降压（无 20ms 轮询延迟）
 function waitForBufferDrain(dataChannel) {
   return new Promise((resolve, reject) => {
     if (!dataChannel || dataChannel.readyState !== "open") {
@@ -277,17 +299,40 @@ function waitForBufferDrain(dataChannel) {
       return;
     }
 
-    const checkInterval = setInterval(() => {
-      if (!activeConn || !activeConn.open || dataChannel.readyState !== "open") {
-        clearInterval(checkInterval);
-        reject(new Error("连接已断开"));
-        return;
+    dataChannel.bufferedAmountLowThreshold = APP_CONFIG.lowBufferedAmount;
+
+    let settled = false;
+    const cleanup = () => {
+      dataChannel.removeEventListener("bufferedamountlow", onLow);
+      dataChannel.removeEventListener("close", onClose);
+      clearInterval(fallbackTimer);
+    };
+
+    const onLow = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    const onClose = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("连接已断开"));
+    };
+
+    dataChannel.addEventListener("bufferedamountlow", onLow);
+    dataChannel.addEventListener("close", onClose);
+
+    // 兜底检查，防止极少数旧浏览器未触发 bufferedamountlow 事件
+    const fallbackTimer = setInterval(() => {
+      if (dataChannel.readyState !== "open") {
+        onClose();
+      } else if (dataChannel.bufferedAmount <= APP_CONFIG.lowBufferedAmount) {
+        onLow();
       }
-      if (dataChannel.bufferedAmount <= APP_CONFIG.maxBufferedAmount / 2) {
-        clearInterval(checkInterval);
-        resolve();
-      }
-    }, 20);
+    }, 80);
   });
 }
 
@@ -300,7 +345,7 @@ function offerFileToReceiver() {
   currentTransferId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   updateSendControls();
 
-  activeConn.send({
+  sendJson(activeConn, {
     type: "file-offer",
     transferId: currentTransferId,
     name: selectedFile.name,
@@ -312,38 +357,52 @@ function offerFileToReceiver() {
   showToast("等待接收方确认接收...");
 }
 
-// 接收方同意后，开始 64 KB 分片流控发送
+// 接收方同意后，批量预读 + 64 KB 原生二进制高速发送
 async function startSendingFileChunks(transferId) {
   if (!selectedFile || !activeConn || !activeConn.open || transferId !== currentTransferId) return;
 
   const file = selectedFile;
   const dataChannel = activeConn.dataChannel;
-  transferStartTime = performance.now();
-  lastSpeedUpdate = 0;
+  lastSpeedTime = performance.now();
+  lastSpeedBytes = 0;
+  currentSpeedBps = 0;
 
-  setStatus("ready", `正在加密直连发送：${file.name}（请勿关闭页面）`, true);
+  setStatus("ready", `正在高速加密直连发送：${file.name}（请勿关闭页面）`, true);
   updateProgress("发送中", 0, file.size, true);
 
-  let offset = 0;
+  let fileOffset = 0;
 
   try {
-    while (offset < file.size) {
+    while (fileOffset < file.size) {
       if (!activeConn || !activeConn.open || transferId !== currentTransferId) {
         throw new Error("连接中断");
       }
 
-      await waitForBufferDrain(dataChannel);
+      // 一次从磁盘批量预读 2 MB，大幅减少异步磁盘 I/O
+      const batchEnd = Math.min(fileOffset + APP_CONFIG.readBatchSize, file.size);
+      const batchBuffer = await file.slice(fileOffset, batchEnd).arrayBuffer();
 
-      const slice = file.slice(offset, offset + APP_CONFIG.chunkSize);
-      const buffer = await slice.arrayBuffer();
+      // 在内存中按 64 KB 零延迟切片送入原生数据通道
+      for (let pos = 0; pos < batchBuffer.byteLength; pos += APP_CONFIG.chunkSize) {
+        if (!activeConn || !activeConn.open || transferId !== currentTransferId) {
+          throw new Error("连接中断");
+        }
 
-      activeConn.send(buffer);
-      offset += buffer.byteLength;
-      updateProgress("发送中", offset, file.size);
+        if (dataChannel.bufferedAmount > APP_CONFIG.maxBufferedAmount) {
+          await waitForBufferDrain(dataChannel);
+        }
+
+        const chunkEnd = Math.min(pos + APP_CONFIG.chunkSize, batchBuffer.byteLength);
+        const chunk = batchBuffer.slice(pos, chunkEnd);
+        activeConn.send(chunk);
+
+        fileOffset += chunk.byteLength;
+        updateProgress("发送中", fileOffset, file.size);
+      }
     }
 
     // 所有分片发完，发送结束与总字节校验通知
-    activeConn.send({
+    sendJson(activeConn, {
       type: "file-end",
       transferId,
       totalBytes: file.size,
@@ -367,13 +426,13 @@ function sendTextMessage() {
     return;
   }
 
-  activeConn.send({ type: "text-message", text });
+  sendJson(activeConn, { type: "text-message", text });
   textInput.value = "";
   resetIdleTimer();
   showToast("文字已加密发送");
 }
 
-// ==================== 阶段 3：接收端数据与完整性校验处理 ====================
+// ==================== 接收端数据与完整性校验处理 ====================
 
 // 将收到的二进制块统一转为 Uint8Array
 async function toUint8Array(data) {
@@ -394,16 +453,15 @@ function triggerDownloadAndFreeMemory(chunks, fileName, mimeType) {
   a.click();
   a.remove();
 
-  // 延迟释放临时下载链接并清空内存数组
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 // 统一处理已建立连接后的业务消息（发送方与接收方共用入口）
-async function handleSessionData(data) {
-  // 1. 收到二进制分片（接收方正在接收文件）
-  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data) || data instanceof Blob) {
+async function handleSessionData(rawData) {
+  // 1. 收到裸二进制分片（接收方正在接收文件）
+  if (rawData instanceof ArrayBuffer || ArrayBuffer.isView(rawData) || rawData instanceof Blob) {
     if (currentRole !== "receiver" || !isTransferring || !pendingIncomingMeta) return;
-    const chunk = await toUint8Array(data);
+    const chunk = await toUint8Array(rawData);
     if (!chunk) return;
 
     receiveChunks.push(chunk);
@@ -412,7 +470,8 @@ async function handleSessionData(data) {
     return;
   }
 
-  if (!data || typeof data !== "object") return;
+  const data = parseControlMessage(rawData);
+  if (!data) return;
 
   // 2. 空闲自动断开通知
   if (data.type === "idle-timeout") {
@@ -421,15 +480,13 @@ async function handleSessionData(data) {
     return;
   }
 
-  // 3. 文字消息（双方均可接收，安全纯文本渲染防 XSS）
+  // 3. 文字消息（安全纯文本渲染防 XSS）
   if (data.type === "text-message") {
     receivedTextContent.textContent = String(data.text || "");
     receivedTextBox.classList.remove("hidden");
     resetIdleTimer();
     showToast("收到一条新文字消息");
-    if (activeConn && activeConn.open) {
-      activeConn.send({ type: "text-ack" });
-    }
+    sendJson(activeConn, { type: "text-ack" });
     return;
   }
 
@@ -446,7 +503,6 @@ async function handleSessionData(data) {
       size: Number(data.size) || 0,
       mime: String(data.mime || "application/octet-stream"),
     };
-    // 严格使用 textContent 防 XSS
     incomingFileName.textContent = pendingIncomingMeta.name;
     incomingFileSize.textContent = formatBytes(pendingIncomingMeta.size);
     incomingBox.classList.remove("hidden");
@@ -486,23 +542,18 @@ async function handleSessionData(data) {
       clearTransferState(true);
       setStatus("error", `文件校验失败（预期 ${expectedSize} 字节，实收 ${receivedBytes} 字节），已清理损坏缓存`, true);
       showToast("文件不完整，已拒绝保存，请让对方重发");
-      if (activeConn && activeConn.open) {
-        activeConn.send({ type: "file-error", transferId: data.transferId });
-      }
+      sendJson(activeConn, { type: "file-error", transferId: data.transferId });
       resetIdleTimer();
       return;
     }
 
-    // 校验通过：拼装下载并立刻释放内存
     updateProgress("已完成", expectedSize, expectedSize, true);
     triggerDownloadAndFreeMemory(receiveChunks, fileName, fileMime);
     clearTransferState(false);
 
     setStatus("ready", `文件「${fileName}」已无损接收并保存！可继续传输`, true);
     showToast(`接收成功：${fileName}`);
-    if (activeConn && activeConn.open) {
-      activeConn.send({ type: "file-done", transferId: data.transferId });
-    }
+    sendJson(activeConn, { type: "file-done", transferId: data.transferId });
     resetIdleTimer();
     return;
   }
@@ -567,7 +618,7 @@ function createSenderRoom() {
     // 严格 1 对 1 锁房：拦截第 3 人
     if (activeConn || pendingConn) {
       conn.on("open", () => {
-        conn.send({
+        sendJson(conn, {
           type: "room-full",
           reason: "该暗号房间已满（仅支持一对一安全传输）",
         });
@@ -636,8 +687,8 @@ acceptConnBtn.addEventListener("click", () => {
   activeConn.on("data", handleSessionData);
 
   const confirmAndNotify = () => {
-    activeConn.send({ type: "connect-accepted" });
-    setStatus("ready", "已建立一对一加密直连（房间已锁定，5 分钟空闲将自动断开）", true);
+    sendJson(activeConn, { type: "connect-accepted" });
+    setStatus("ready", "已建立一对一高速加密直连（房间已锁定，5 分钟空闲将自动断开）", true);
     createRoomBtn.textContent = "已与对方加密直连";
     updateSendControls();
     resetIdleTimer();
@@ -659,7 +710,7 @@ rejectConnBtn.addEventListener("click", () => {
   connectRequestBox.classList.add("hidden");
 
   const rejectAndClose = () => {
-    rejected.send({ type: "connect-rejected", reason: "发送方拒绝了本次连接请求" });
+    sendJson(rejected, { type: "connect-rejected", reason: "发送方拒绝了本次连接请求" });
     setTimeout(() => {
       try { rejected.close(); } catch {}
     }, 250);
@@ -705,38 +756,45 @@ function joinReceiverRoom() {
 
   peer.on("open", () => {
     const targetPeerId = codeToPeerId(rawCode);
-    const conn = peer.connect(targetPeerId, { reliable: true });
+    // 使用原生 raw 序列化模式，绕过 BinaryPack 性能开销，释放 WebRTC 满血网速
+    const conn = peer.connect(targetPeerId, {
+      reliable: true,
+      serialization: "raw",
+    });
 
     conn.on("open", () => {
       setStatus("waiting", "已找到发送方，等待对方点击「同意连接」...", true);
     });
 
-    conn.on("data", (msg) => {
-      if (msg && typeof msg === "object" && !activeConn) {
-        if (msg.type === "room-full") {
-          clearTimeout(connectTimer);
-          resetSession(msg.reason || "该暗号房间已满（仅支持一对一传输）");
-          showToast("房间已满，无法加入");
-          return;
-        }
-        if (msg.type === "connect-rejected") {
-          clearTimeout(connectTimer);
-          resetSession(msg.reason || "发送方拒绝了你的连接请求");
-          showToast("对方拒绝了连接请求");
-          return;
-        }
-        if (msg.type === "connect-accepted") {
-          clearTimeout(connectTimer);
-          activeConn = conn;
-          setStatus("ready", "已建立一对一加密直连，等待对方发送文件或文字（5 分钟无操作自动断开）", true);
-          resetIdleTimer();
-          showToast("配对成功！等待发送方传文件");
-          return;
+    conn.on("data", (rawData) => {
+      if (!activeConn) {
+        const msg = parseControlMessage(rawData);
+        if (msg) {
+          if (msg.type === "room-full") {
+            clearTimeout(connectTimer);
+            resetSession(msg.reason || "该暗号房间已满（仅支持一对一传输）");
+            showToast("房间已满，无法加入");
+            return;
+          }
+          if (msg.type === "connect-rejected") {
+            clearTimeout(connectTimer);
+            resetSession(msg.reason || "发送方拒绝了你的连接请求");
+            showToast("对方拒绝了连接请求");
+            return;
+          }
+          if (msg.type === "connect-accepted") {
+            clearTimeout(connectTimer);
+            activeConn = conn;
+            setStatus("ready", "已建立一对一高速加密直连，等待对方发送文件或文字（5 分钟无操作自动断开）", true);
+            resetIdleTimer();
+            showToast("配对成功！等待发送方传文件");
+            return;
+          }
         }
       }
 
       if (activeConn === conn) {
-        handleSessionData(msg);
+        handleSessionData(rawData);
       }
     });
 
@@ -775,14 +833,15 @@ acceptFileBtn.addEventListener("click", () => {
   clearIdleTimer();
   receiveChunks = [];
   receivedBytes = 0;
-  transferStartTime = performance.now();
-  lastSpeedUpdate = 0;
+  lastSpeedTime = performance.now();
+  lastSpeedBytes = 0;
+  currentSpeedBps = 0;
   incomingBox.classList.add("hidden");
 
-  setStatus("ready", `正在加密直连接收：${pendingIncomingMeta.name}（请勿关闭页面）`, true);
+  setStatus("ready", `正在高速加密直连接收：${pendingIncomingMeta.name}（请勿关闭页面）`, true);
   updateProgress("接收中", 0, pendingIncomingMeta.size, true);
 
-  activeConn.send({
+  sendJson(activeConn, {
     type: "file-accept",
     transferId: pendingIncomingMeta.transferId,
   });
@@ -793,7 +852,7 @@ rejectFileBtn.addEventListener("click", () => {
   if (!activeConn || !activeConn.open || !pendingIncomingMeta) return;
   const rejectedId = pendingIncomingMeta.transferId;
   clearTransferState(true);
-  activeConn.send({ type: "file-reject", transferId: rejectedId });
+  sendJson(activeConn, { type: "file-reject", transferId: rejectedId });
   setStatus("ready", "已拒绝该文件，继续保持连接", true);
   resetIdleTimer();
   showToast("已拒绝接收该文件");
