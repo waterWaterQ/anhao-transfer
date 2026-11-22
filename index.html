@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>暗号快传 · 点对点免网盘文件传输</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="page">
+    <!-- 顶部栏：项目名与深浅主题切换 -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-logo" aria-hidden="true">⚡</span>
+        <div>
+          <h1 id="app-title">暗号快传</h1>
+          <p class="brand-desc">点对点直连 · 不限速 · 不经网盘</p>
+        </div>
+      </div>
+      <button id="theme-toggle" class="icon-btn" type="button" title="切换浅色/深色主题">
+        🌙 暗黑
+      </button>
+    </header>
+
+    <!-- 主卡片 -->
+    <main class="card">
+      <!-- 模式切换标签 -->
+      <div class="tabs" role="tablist">
+        <button id="tab-send" class="tab active" type="button" role="tab" aria-selected="true">
+          📤 我要发送
+        </button>
+        <button id="tab-receive" class="tab" type="button" role="tab" aria-selected="false">
+          📥 我要接收
+        </button>
+      </div>
+
+      <!-- 连接状态提示条 -->
+      <div id="status-bar" class="status-bar status-idle">
+        <span class="status-dot"></span>
+        <span id="status-text">未连接：请创建暗号房间或输入对方暗号</span>
+        <button id="btn-disconnect" class="btn btn-small hidden" type="button">断开</button>
+      </div>
+
+      <!-- ==================== 发送面板 ==================== -->
+      <section id="panel-send" class="panel active">
+        <div class="section-block">
+          <label class="label" for="send-code-input">第 1 步：设置本次暗号（至少 4 位，支持字母/数字/中文）</label>
+          <div class="code-row">
+            <input
+              id="send-code-input"
+              class="code-input"
+              type="text"
+              maxlength="16"
+              placeholder="输入或随机生成暗号"
+              autocomplete="off"
+            />
+            <button id="btn-random-code" class="btn btn-secondary" type="button">🎲 换一个</button>
+            <button id="btn-copy-code" class="btn btn-secondary" type="button">📋 复制</button>
+          </div>
+          <p class="hint">将暗号告诉对方，对方输入后需你手动同意才会建立一对一加密直连。</p>
+          <button id="btn-create-room" class="btn btn-primary btn-full" type="button">
+            生成房间并等待对方连接
+          </button>
+
+          <!-- 发件方：收到连接请求时的二次确认卡片 -->
+          <div id="connect-request-box" class="incoming-box hidden">
+            <p class="incoming-title">🔔 有设备使用当前暗号请求连接</p>
+            <p class="hint">确认是你的接收方后再点同意，同意后房间将自动上锁（拒绝第三人）。</p>
+            <div class="action-row">
+              <button id="btn-accept-conn" class="btn btn-primary" type="button">✅ 同意连接</button>
+              <button id="btn-reject-conn" class="btn btn-danger" type="button">❌ 拒绝</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section-block">
+          <label class="label">第 2 步：选择要发送的文件或文字</label>
+
+          <!-- 拖拽/选择文件区域 -->
+          <div id="drop-zone" class="drop-zone" tabindex="0">
+            <input id="file-input" type="file" hidden />
+            <div class="drop-icon">📁</div>
+            <p class="drop-title">点击选择文件，或将文件拖到这里</p>
+            <p class="drop-sub">支持任意格式 · 原画无损 · 建议单文件 500 MB 以内</p>
+          </div>
+
+          <!-- 已选文件预览 -->
+          <div id="selected-file-box" class="file-preview hidden">
+            <div class="file-info">
+              <span id="selected-file-name" class="file-name"></span>
+              <span id="selected-file-size" class="file-size"></span>
+            </div>
+            <button id="btn-send-file" class="btn btn-primary" type="button" disabled>
+              发送文件
+            </button>
+          </div>
+
+          <!-- 互传文字/网址区域 -->
+          <div class="text-send-box">
+            <textarea
+              id="text-input"
+              rows="2"
+              placeholder="也可以在这里输入一段文字或网址，方便手机与电脑互发..."
+            ></textarea>
+            <button id="btn-send-text" class="btn btn-secondary" type="button" disabled>
+              发送文字
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 接收面板 ==================== -->
+      <section id="panel-receive" class="panel">
+        <div class="section-block">
+          <label class="label" for="receive-code-input">输入对方告诉你的暗号</label>
+          <div class="code-row">
+            <input
+              id="receive-code-input"
+              class="code-input"
+              type="text"
+              maxlength="16"
+              placeholder="例如：K7M9P2"
+              autocomplete="off"
+            />
+            <button id="btn-join-room" class="btn btn-primary" type="button">连接</button>
+          </div>
+          <p class="hint">连接成功后，你会在看到文件名和大小并手动确认后才开始接收。</p>
+        </div>
+
+        <!-- 待确认接收卡片（占位，阶段 3 启用） -->
+        <div id="incoming-box" class="incoming-box hidden">
+          <p class="incoming-title">对方请求发送文件：</p>
+          <div class="file-info">
+            <span id="incoming-file-name" class="file-name"></span>
+            <span id="incoming-file-size" class="file-size"></span>
+          </div>
+          <div class="action-row">
+            <button id="btn-accept-file" class="btn btn-primary" type="button">✅ 同意接收</button>
+            <button id="btn-reject-file" class="btn btn-danger" type="button">❌ 拒绝</button>
+          </div>
+        </div>
+
+        <!-- 收到的文字消息展示区 -->
+        <div id="received-text-box" class="received-text-box hidden">
+          <div class="received-text-header">
+            <span>收到的文字消息</span>
+            <button id="btn-copy-text" class="btn btn-small" type="button">复制文字</button>
+          </div>
+          <pre id="received-text-content" class="received-text-content"></pre>
+        </div>
+      </section>
+
+      <!-- 通用传输进度条（传输时显示） -->
+      <div id="progress-box" class="progress-box hidden">
+        <div class="progress-meta">
+          <span id="progress-label">准备传输...</span>
+          <span id="progress-speed">0 MB/s</span>
+        </div>
+        <div class="progress-track">
+          <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 底部开源与隐私须知 -->
+    <footer class="notice-footer">
+      <p>
+        🔒 <strong>隐私与使用须知</strong>：文件通过 WebRTC 端到端加密点对点直连，<strong>不经过也不存储在任何服务器</strong>。传输期间需双方保持网页打开；因点对点直连特性，双方网络 IP 彼此可见，建议用于熟人或自有设备间互传。
+      </p>
+    </footer>
+  </div>
+
+  <!-- 轻提示弹窗 -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- 引入锁定版本的 PeerJS（用于 WebRTC 暗号握手与点对点数据通道） -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
