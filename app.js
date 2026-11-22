@@ -8,10 +8,9 @@ const APP_CONFIG = {
   connectTimeoutMs: 15000, // 15 秒连接超时保护
   idleTimeoutMs: 5 * 60 * 1000, // 5 分钟空闲自动断开保护
   readBatchSize: 8 * 1024 * 1024, // 8 MB 双缓冲流水线预读，消除磁盘 I/O 等待
-  defaultChunkSize: 64 * 1024, // 64 KB 保底分片
-  maxChunkSize: 256 * 1024, // 若浏览器 SCTP 支持，最高自动升至 256 KB 大分片
-  maxBufferedAmount: 12 * 1024 * 1024, // 12 MB 高水位缓冲区，喂饱高速局域网带宽
-  lowBufferedAmount: 4 * 1024 * 1024, // 降到 4 MB 立即唤醒补满，保持管道不断流
+  chunkSize: 64 * 1024, // 64 KB 原生二进制分片（100% 兼容所有浏览器 SCTP 限制且吞吐极高）
+  maxBufferedAmount: 4 * 1024 * 1024, // 4 MB 高水位缓冲区（严格低于 PeerJS 内部 8MB 阈值）
+  lowBufferedAmount: 1 * 1024 * 1024, // 降到 1 MB 立即唤醒补满，保持管道不断流
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
   iceServers: [
     { urls: "stun:stun.miwifi.com:3478" },
@@ -87,6 +86,7 @@ let currentTransferId = null;
 let pendingIncomingMeta = null;
 let receiveChunks = [];
 let receivedBytes = 0;
+let transferStartTime = 0;
 let lastSpeedTime = 0;
 let lastSpeedBytes = 0;
 let currentSpeedBps = 0;
@@ -220,13 +220,17 @@ function showToast(message) {
 function updateProgress(label, transferred, total, force = false) {
   const now = performance.now();
   const deltaMs = now - lastSpeedTime;
-  if (!force && deltaMs < 150 && transferred < total) return;
+  if (!force && deltaMs < 120 && transferred < total) return;
 
-  if (deltaMs >= 150) {
+  if (deltaMs >= 120) {
     const deltaBytes = Math.max(0, transferred - lastSpeedBytes);
     currentSpeedBps = (deltaBytes / deltaMs) * 1000;
     lastSpeedTime = now;
     lastSpeedBytes = transferred;
+  } else if (transferred > 0 && (currentSpeedBps === 0 || transferred >= total)) {
+    // 若文件在 120ms 内瞬间秒传完成，按实际总耗时计算真实速率，避免显示为 0
+    const totalSec = Math.max((now - transferStartTime) / 1000, 0.005);
+    currentSpeedBps = transferred / totalSec;
   }
 
   const percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 100;
@@ -402,13 +406,14 @@ async function startSendingFileChunks(transferId) {
   const file = selectedFile;
   const dataChannel = activeConn.dataChannel;
   configureFastDataChannel(activeConn);
-  const chunkSize = getOptimalChunkSize(activeConn);
+  const chunkSize = APP_CONFIG.chunkSize;
 
-  lastSpeedTime = performance.now();
+  transferStartTime = performance.now();
+  lastSpeedTime = transferStartTime;
   lastSpeedBytes = 0;
   currentSpeedBps = 0;
 
-  setStatus("ready", `正在极速加密直连发送：${file.name}（分片 ${chunkSize / 1024}KB，请勿关闭页面）`, true);
+  setStatus("ready", `正在极速加密直连发送：${file.name}（请勿关闭页面）`, true);
   updateProgress("发送中", 0, file.size, true);
 
   let readOffset = 0;
@@ -810,7 +815,7 @@ function joinReceiverRoom() {
     const targetPeerId = codeToPeerId(rawCode);
     const conn = peer.connect(targetPeerId, {
       reliable: true,
-      serialization: "raw",
+      serialization: "none",
     });
 
     conn.on("open", () => {
@@ -891,7 +896,8 @@ acceptFileBtn.addEventListener("click", () => {
   clearIdleTimer();
   receiveChunks = [];
   receivedBytes = 0;
-  lastSpeedTime = performance.now();
+  transferStartTime = performance.now();
+  lastSpeedTime = transferStartTime;
   lastSpeedBytes = 0;
   currentSpeedBps = 0;
   incomingBox.classList.add("hidden");
