@@ -169,24 +169,34 @@ function loadCustomTurnConfig() {
   }
 }
 
+// 解析并自动规范化用户输入的 TURN 地址（自动清理引号/括号，未写协议前缀时自动补全 turn:）
+function parseTurnUrls(rawInput) {
+  if (!rawInput) return [];
+  return rawInput
+    .split(/[\s,;]+/)
+    .map((item) => item.replace(/^["'\[\(]+|["'\]\)]+$/g, "").trim())
+    .filter(Boolean)
+    .map((item) => {
+      if (/^(stun|turn|turns):/i.test(item)) return item;
+      // 兼容直接粘入域名:端口（如 free.expressturn.com:3478）
+      if (/^[a-z0-9.-]+(:\d+)?(\?.*)?$/i.test(item)) return `turn:${item}`;
+      return "";
+    })
+    .filter(Boolean);
+}
+
 function getRtcConfiguration() {
   const custom = loadCustomTurnConfig();
   const iceServers = [...APP_CONFIG.defaultStunServers];
   let hasTurn = false;
 
-  if (custom.urls) {
-    const urlList = custom.urls
-      .split(/[\s,]+/)
-      .map((u) => u.trim())
-      .filter((u) => /^(stun|turn|turns):/i.test(u));
-
-    if (urlList.length > 0) {
-      const turnEntry = { urls: urlList };
-      if (custom.username) turnEntry.username = custom.username;
-      if (custom.credential) turnEntry.credential = custom.credential;
-      iceServers.push(turnEntry);
-      hasTurn = urlList.some((u) => /^turns?:/i.test(u));
-    }
+  const urlList = parseTurnUrls(custom.urls);
+  if (urlList.length > 0) {
+    const turnEntry = { urls: urlList };
+    if (custom.username) turnEntry.username = custom.username;
+    if (custom.credential) turnEntry.credential = custom.credential;
+    iceServers.push(turnEntry);
+    hasTurn = urlList.some((u) => /^turns?:/i.test(u));
   }
 
   // 若未填 TURN 但选了 relay，自动回退 all 并提示，防止空选路
@@ -203,18 +213,25 @@ function hydrateTurnInputs() {
 }
 
 saveTurnBtn.addEventListener("click", () => {
+  const normalizedUrls = parseTurnUrls(turnUrlsInput.value.trim());
   const cfg = {
-    urls: turnUrlsInput.value.trim(),
+    urls: normalizedUrls.join(" "),
     username: turnUserInput.value.trim(),
     credential: turnPassInput.value.trim(),
     policy: icePolicySelect.value === "relay" ? "relay" : "all",
   };
-  if (cfg.policy === "relay" && !/^turns?:/i.test(cfg.urls)) {
-    showToast("选择「仅走中继（relay）」前，请先填入有效的 turn: 或 turns: 地址");
+  const turnCount = normalizedUrls.filter((u) => /^turns?:/i.test(u)).length;
+  if (cfg.policy === "relay" && turnCount === 0) {
+    showToast("选择「仅走中继（relay）」前，请先填入有效的 TURN 地址");
     return;
   }
+  turnUrlsInput.value = cfg.urls;
   localStorage.setItem(APP_CONFIG.turnStorageKey, JSON.stringify(cfg));
-  showToast("高级网络设置已保存（仅存本地浏览器，下次连接生效）");
+  showToast(
+    turnCount > 0
+      ? `✅ 已保存！识别到 ${turnCount} 个 TURN 中转地址（下次连接生效）`
+      : "已保存（当前未识别到 TURN 地址，将走纯 P2P 直连）"
+  );
 });
 
 clearTurnBtn.addEventListener("click", () => {
