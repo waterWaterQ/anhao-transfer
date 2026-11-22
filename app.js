@@ -9,9 +9,9 @@ const APP_CONFIG = {
   approvalTimeoutMs: 60000, // 找到房间后给足 60 秒等待发件方点击“同意连接”
   idleTimeoutMs: 5 * 60 * 1000, // 5 分钟空闲自动断开保护
   readBatchSize: 2 * 1024 * 1024, // 2 MB 双缓冲流水线预读，消除磁盘 I/O 等待
-  chunkSize: 64 * 1024, // 64 KB 原生二进制分片（100% 兼容所有浏览器 SCTP 限制且吞吐极高）
-  maxBufferedAmount: 256 * 1024, // 256 KB 紧耦合流控缓冲区：既跑满带宽，又保证进度与网速 100% 真实不虚跑
-  lowBufferedAmount: 64 * 1024, // 降到 64 KB 立即事件唤醒续发，保持管道不断流
+  chunkSize: 16 * 1024, // 16 KB WebRTC 跨公网/移动端黄金兼容分片（原生零拷贝，兼顾高速与 100% 不卡死）
+  maxBufferedAmount: 512 * 1024, // 512 KB 流控缓冲区：跨网高延迟下持续喂饱带宽且进度真实
+  lowBufferedAmount: 128 * 1024, // 降到 128 KB 立即事件唤醒续发，保持管道不断流
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
   iceServers: [
     { urls: "stun:stun.qq.com:3478" },
@@ -478,10 +478,11 @@ async function startSendingFileChunks(transferId) {
       totalBytes: file.size,
     });
     updateProgress("校验中", file.size, file.size, true);
-  } catch {
+  } catch (err) {
     if (isTransferring) {
       clearTransferState(true);
-      setStatus("error", "文件发送中断，请确认双方网络正常后重试", Boolean(peer));
+      const reason = err && err.message ? `（${err.message}）` : "";
+      setStatus("error", `文件发送中断${reason}，请确认双方网络正常后重试`, Boolean(peer));
       showToast("发送中断");
     }
   }
