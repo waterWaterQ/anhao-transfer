@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>暗号快传 · 点对点免网盘文件传输</title>
-  <link rel="stylesheet" href="style.css" />
+  <title>暗号快传 · 国内点对点免网盘文件传输</title>
+  <link rel="stylesheet" href="style.css?v=10" />
 </head>
 <body>
   <div class="page">
@@ -175,8 +175,8 @@
   <!-- 轻提示弹窗 -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
-  <!-- 引入锁定版本的 PeerJS（用于 WebRTC 暗号握手与点对点数据通道） -->
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="app.js?v=3"></script>
+  <!-- 纯国内零第三方依赖信令与原生 WebRTC 传输引擎 -->
+  <script src="signal.js?v=10"></script>
+  <script src="app.js?v=10"></script>
 </body>
 </html>
