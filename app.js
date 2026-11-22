@@ -14,8 +14,8 @@ const APP_CONFIG = {
   idleTimeoutMs: 5 * 60 * 1000, // 5 分钟空闲自动断开保护
   readBatchSize: 2 * 1024 * 1024, // 2 MB 双缓冲流水线预读
   chunkSize: 16 * 1024, // 16 KB WebRTC 跨网/移动端黄金兼容分片（原生零拷贝）
-  maxBufferedAmount: 512 * 1024, // 512 KB 流控缓冲区
-  lowBufferedAmount: 128 * 1024, // 降到 128 KB 立刻事件唤醒续发
+  maxBufferedAmount: 2 * 1024 * 1024, // 2 MB 窗口上限：高延迟跨网/中继也能喂饱数 MB/s 管道
+  lowBufferedAmount: 1 * 1024 * 1024, // 降到 1 MB 时立即唤醒补满，保持在途数据不断流
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
   turnStorageKey: "anhao_custom_turn_v1",
   // 100% 纯国内公共 STUN 节点
@@ -1137,7 +1137,7 @@ function waitForBufferDrain() {
       } else if (dc.bufferedAmount <= APP_CONFIG.lowBufferedAmount) {
         onLow();
       }
-    }, 40);
+    }, 20);
   });
 }
 
