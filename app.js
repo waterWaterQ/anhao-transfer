@@ -14,9 +14,10 @@ const APP_CONFIG = {
   lowBufferedAmount: 4 * 1024 * 1024, // 降到 4 MB 立即唤醒补满，保持管道不断流
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
   iceServers: [
+    { urls: "stun:stun.miwifi.com:3478" },
+    { urls: "stun:stun.cloudflare.com:3478" },
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun.cloudflare.com:3478" },
   ],
 };
 
