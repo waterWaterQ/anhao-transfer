@@ -5,18 +5,23 @@ const APP_CONFIG = {
   codeAlphabet: "23456789ABCDEFGHJKLMNPQRSTUVWXYZ", // 排除易混淆字符 0/O/1/I/l
   defaultCodeLength: 6,
   minCodeLength: 4,
-  connectTimeoutMs: 15000, // 15 秒连接超时保护
+  connectTimeoutMs: 15000, // 15 秒找房间超时保护
+  approvalTimeoutMs: 60000, // 找到房间后给足 60 秒等待发件方点击“同意连接”
   idleTimeoutMs: 5 * 60 * 1000, // 5 分钟空闲自动断开保护
-  readBatchSize: 8 * 1024 * 1024, // 8 MB 双缓冲流水线预读，消除磁盘 I/O 等待
+  readBatchSize: 2 * 1024 * 1024, // 2 MB 双缓冲流水线预读，消除磁盘 I/O 等待
   chunkSize: 64 * 1024, // 64 KB 原生二进制分片（100% 兼容所有浏览器 SCTP 限制且吞吐极高）
-  maxBufferedAmount: 4 * 1024 * 1024, // 4 MB 高水位缓冲区（严格低于 PeerJS 内部 8MB 阈值）
-  lowBufferedAmount: 1 * 1024 * 1024, // 降到 1 MB 立即唤醒补满，保持管道不断流
+  maxBufferedAmount: 256 * 1024, // 256 KB 紧耦合流控缓冲区：既跑满带宽，又保证进度与网速 100% 真实不虚跑
+  lowBufferedAmount: 64 * 1024, // 降到 64 KB 立即事件唤醒续发，保持管道不断流
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
   iceServers: [
-    { urls: "stun:stun.miwifi.com:3478" },
     { urls: "stun:stun.cloudflare.com:3478" },
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"],
+      username: "peerjs",
+      credential: "peerjs",
+    },
   ],
 };
 
@@ -220,17 +225,22 @@ function showToast(message) {
 function updateProgress(label, transferred, total, force = false) {
   const now = performance.now();
   const deltaMs = now - lastSpeedTime;
-  if (!force && deltaMs < 120 && transferred < total) return;
+  if (!force && deltaMs < 100 && transferred < total) return;
 
-  if (deltaMs >= 120) {
+  const totalElapsedSec = Math.max((now - transferStartTime) / 1000, 0.01);
+
+  if (deltaMs >= 100) {
     const deltaBytes = Math.max(0, transferred - lastSpeedBytes);
-    currentSpeedBps = (deltaBytes / deltaMs) * 1000;
+    const instantBps = (deltaBytes / deltaMs) * 1000;
+    // 指数平滑网速，既灵敏又不会剧烈跳变或掉为 0
+    currentSpeedBps = currentSpeedBps > 0 ? currentSpeedBps * 0.4 + instantBps * 0.6 : instantBps;
     lastSpeedTime = now;
     lastSpeedBytes = transferred;
-  } else if (transferred > 0 && (currentSpeedBps === 0 || transferred >= total)) {
-    // 若文件在 120ms 内瞬间秒传完成，按实际总耗时计算真实速率，避免显示为 0
-    const totalSec = Math.max((now - transferStartTime) / 1000, 0.005);
-    currentSpeedBps = transferred / totalSec;
+  }
+
+  // 若瞬时速度尚未采样或刚启动/刚结束，使用全程真实平均速度兜底，绝不显示为 0
+  if (transferred > 0 && currentSpeedBps <= 0) {
+    currentSpeedBps = transferred / totalElapsedSec;
   }
 
   const percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 100;
@@ -815,12 +825,20 @@ function joinReceiverRoom() {
     const targetPeerId = codeToPeerId(rawCode);
     const conn = peer.connect(targetPeerId, {
       reliable: true,
-      serialization: "none",
+      serialization: "raw",
     });
 
     conn.on("open", () => {
       configureFastDataChannel(conn);
       setStatus("waiting", "已找到发送方，等待对方点击「同意连接」...", true);
+      // 已成功连通房间，将超时放宽为 60 秒等待对方点击“同意连接”
+      clearTimeout(connectTimer);
+      connectTimer = setTimeout(() => {
+        if (!activeConn) {
+          resetSession("等待对方点击「同意连接」超时（60秒），请提醒对方确认");
+          showToast("对方长时间未点击同意连接");
+        }
+      }, APP_CONFIG.approvalTimeoutMs);
     });
 
     conn.on("data", async (rawData) => {
