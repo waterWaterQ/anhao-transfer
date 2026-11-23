@@ -14,8 +14,8 @@ const APP_CONFIG = {
   idleTimeoutMs: 5 * 60 * 1000, // 5 分钟空闲自动断开保护
   readBatchSize: 2 * 1024 * 1024, // 2 MB 双缓冲流水线预读
   chunkSize: 64 * 1024, // 根据双方 SCTP 协商结果进一步缩小
-  maxBufferedAmount: 2 * 1024 * 1024, // 2 MB 窗口上限：高延迟跨网/中继也能喂饱数 MB/s 管道
-  lowBufferedAmount: 1 * 1024 * 1024, // 降到 1 MB 时立即唤醒补满，保持在途数据不断流
+  maxBufferedAmount: 1024 * 1024, // 1 MB 窗口上限：高延迟跨网够喂饱，又避免大口突发造成丢包锯齿
+  lowBufferedAmount: 768 * 1024, // 降到 768 KB 立刻温和续水 256 KB，让传输更平顺不断流
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
   turnStorageKey: "anhao_custom_turn_v1",
   // 100% 纯国内公共 STUN 节点
@@ -131,6 +131,7 @@ let receivedBytes = 0;
 let transferStartTime = 0;
 let lastSpeedTime = 0;
 let lastSpeedBytes = 0;
+let speedSamples = [];       // 1.5 秒滑动窗口采样点，消除高延迟 ACK 间隔导致速度在 0 KB/s 间跳动
 let currentSpeedBps = 0;
 
 // ==================== 分阶段诊断工具 ====================
@@ -394,20 +395,22 @@ function updateSendControls() {
 
 function updateProgress(label, transferred, total, force = false) {
   const now = performance.now();
-  const deltaMs = now - lastSpeedTime;
-  if (!force && deltaMs < 100 && transferred < total) return;
+  if (!force && now - lastSpeedTime < 150 && transferred < total) return;
+  lastSpeedTime = now;
 
-  const totalElapsedSec = Math.max((now - transferStartTime) / 1000, 0.01);
-
-  if (deltaMs >= 100) {
-    const deltaBytes = Math.max(0, transferred - lastSpeedBytes);
-    const instantBps = (deltaBytes / deltaMs) * 1000;
-    currentSpeedBps = currentSpeedBps > 0 ? currentSpeedBps * 0.4 + instantBps * 0.6 : instantBps;
-    lastSpeedTime = now;
-    lastSpeedBytes = transferred;
+  // 记录 1.5 秒滑动窗口采样，跨国高延迟（200~300ms RTT）下不会因短暂无 ACK 误跌为 0 KB/s
+  speedSamples.push({ t: now, b: transferred });
+  const windowMs = 1500;
+  while (speedSamples.length > 2 && now - speedSamples[0].t > windowMs) {
+    speedSamples.shift();
   }
 
-  if (transferred > 0 && currentSpeedBps <= 0) {
+  const first = speedSamples[0];
+  const spanSec = first ? (now - first.t) / 1000 : 0;
+  if (spanSec >= 0.15) {
+    currentSpeedBps = Math.max(0, transferred - first.b) / spanSec;
+  } else if (transferred > 0 && transferStartTime > 0) {
+    const totalElapsedSec = Math.max((now - transferStartTime) / 1000, 0.01);
     currentSpeedBps = transferred / totalElapsedSec;
   }
 
@@ -429,6 +432,7 @@ function clearTransferState(hideProgress = false) {
   receiveChunks = [];
   receiveChunkBytes = 0;
   receivedBytes = 0;
+  speedSamples = [];
   currentSpeedBps = 0;
   incomingBox.classList.add("hidden");
   if (hideProgress) {
@@ -1296,6 +1300,7 @@ async function startSendingFileChunks(transferId) {
   transferStartTime = performance.now();
   lastSpeedTime = transferStartTime;
   lastSpeedBytes = 0;
+  speedSamples = [{ t: transferStartTime, b: 0 }];
   currentSpeedBps = 0;
 
   setStatus("ready", `正在加密发送：${file.name}（请勿关闭页面）`, true);
@@ -1564,6 +1569,7 @@ acceptFileBtn.addEventListener("click", () => {
   transferStartTime = performance.now();
   lastSpeedTime = transferStartTime;
   lastSpeedBytes = 0;
+  speedSamples = [{ t: transferStartTime, b: 0 }];
   currentSpeedBps = 0;
   incomingBox.classList.add("hidden");
 
