@@ -24,6 +24,7 @@ class MqttSignalClient {
     this.closed = false;
     let lastErr = null;
     for (const url of SIGNAL_BROKERS) {
+      if (this.closed) throw new Error("已取消连接");
       try {
         await this._connectSingle(url, timeoutPerBrokerMs);
         return url;
@@ -41,6 +42,7 @@ class MqttSignalClient {
       const done = (ok, val) => {
         if (settled) return;
         settled = true;
+        this.cancelConnect = null;
         clearTimeout(timer);
         ok ? resolve(val) : reject(val);
       };
@@ -48,6 +50,7 @@ class MqttSignalClient {
       const timer = setTimeout(() => {
         done(false, new Error(`连接超时: ${url}`));
       }, timeoutMs);
+      this.cancelConnect = () => done(false, new Error("已取消连接"));
 
       let ws;
       try {
@@ -145,6 +148,7 @@ class MqttSignalClient {
 
   close() {
     this.closed = true;
+    this.cancelConnect?.();
     this._stopPing();
     if (this.ws) {
       try {

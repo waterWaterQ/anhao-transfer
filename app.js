@@ -13,7 +13,7 @@ const APP_CONFIG = {
   maxIceRestarts: 1, // 有界执行最多 1 次 restartIce() 尝试恢复
   idleTimeoutMs: 5 * 60 * 1000, // 5 分钟空闲自动断开保护
   readBatchSize: 2 * 1024 * 1024, // 2 MB 双缓冲流水线预读
-  chunkSize: 16 * 1024, // 16 KB WebRTC 跨网/移动端黄金兼容分片（原生零拷贝）
+  chunkSize: 64 * 1024, // 根据双方 SCTP 协商结果进一步缩小
   maxBufferedAmount: 2 * 1024 * 1024, // 2 MB 窗口上限：高延迟跨网/中继也能喂饱数 MB/s 管道
   lowBufferedAmount: 1 * 1024 * 1024, // 降到 1 MB 时立即唤醒补满，保持在途数据不断流
   largeFileWarnBytes: 500 * 1024 * 1024, // 500 MB 大文件提醒阈值
@@ -100,6 +100,10 @@ let dc = null;
 let currentSessionId = null;  // 每次点对点会话唯一 ID，防止旧会话迟到消息干扰
 let currentIceGen = 0;        // ICE 代次号，restartIce 时递增
 let iceRestartCount = 0;
+let remoteIceGen = 0;         // 当前已成功设置的远端 SDP 代次
+let recoveryTimer = null;
+let currentRouteIsRelay = false; // 记录当前是否走 TURN 中继，用于自适应选择最稳分片
+let drainProgressTimer = null;   // 发完分片后继续平滑刷新尾段缓冲排空进度
 let pendingIceMap = new Map(); // key: `${sessionId}:${iceGen}` -> RTCIceCandidateInit[]
 let disconnectedGraceTimer = null;
 
@@ -163,7 +167,7 @@ function loadCustomTurnConfig() {
     return {
       urls: String(parsed.urls || "").trim(),
       username: String(parsed.username || "").trim(),
-      credential: String(parsed.credential || "").trim(),
+      credential: String(parsed.credential || ""),
       policy: parsed.policy === "relay" ? "relay" : "all",
     };
   } catch {
@@ -174,21 +178,20 @@ function loadCustomTurnConfig() {
 // 解析并自动规范化用户输入的 TURN 地址（自动清理引号/括号，未写协议前缀时自动补全 turn:）
 function parseTurnUrls(rawInput) {
   if (!rawInput) return [];
-  return rawInput
+  let urls = rawInput.trim();
+  if (/^\[\s*(?:["']|(?:stun|turns?):)/i.test(urls) && urls.endsWith("]")) urls = urls.slice(1, -1);
+  return urls
     .split(/[\s,;]+/)
-    .map((item) => item.replace(/^["'\[\(]+|["'\]\)]+$/g, "").trim())
+    .map((item) => item.replace(/^["'(]+|["')]+$/g, "").trim())
     .filter(Boolean)
     .map((item) => {
       if (/^(stun|turn|turns):/i.test(item)) return item;
       // 兼容直接粘入域名:端口（如 free.expressturn.com:3478）
-      if (/^[a-z0-9.-]+(:\d+)?(\?.*)?$/i.test(item)) return `turn:${item}`;
-      return "";
-    })
-    .filter(Boolean);
+      return /^(?:[a-z0-9.-]+|\[[a-f0-9:]+\])(:\d+)?(\?.*)?$/i.test(item) ? `turn:${item}` : item;
+    });
 }
 
-function getRtcConfiguration() {
-  const custom = loadCustomTurnConfig();
+function getRtcConfiguration(custom = loadCustomTurnConfig()) {
   const iceServers = [...APP_CONFIG.defaultStunServers];
   let hasTurn = false;
 
@@ -219,16 +222,36 @@ saveTurnBtn.addEventListener("click", () => {
   const cfg = {
     urls: normalizedUrls.join(" "),
     username: turnUserInput.value.trim(),
-    credential: turnPassInput.value.trim(),
+    credential: turnPassInput.value,
     policy: icePolicySelect.value === "relay" ? "relay" : "all",
   };
   const turnCount = normalizedUrls.filter((u) => /^turns?:/i.test(u)).length;
+  if (turnUrlsInput.value.trim() && (!normalizedUrls.length || normalizedUrls.some(u => !/^(?:stun|turns?):/i.test(u)))) {
+    showToast("地址格式无效，请填写 turn:主机:端口 或 turns:主机:端口");
+    return;
+  }
+  if (turnCount && (!cfg.username || !cfg.credential)) {
+    showToast("请填写 TURN 服务提供的用户名和密码");
+    return;
+  }
   if (cfg.policy === "relay" && turnCount === 0) {
     showToast("选择「仅走中继（relay）」前，请先填入有效的 TURN 地址");
     return;
   }
+  try {
+    const { iceServers, iceTransportPolicy } = getRtcConfiguration(cfg);
+    new RTCPeerConnection({ iceServers, iceTransportPolicy }).close();
+  } catch {
+    showToast("浏览器无法使用这组 ICE 地址，请检查协议、端口和凭据");
+    return;
+  }
+  try {
+    localStorage.setItem(APP_CONFIG.turnStorageKey, JSON.stringify(cfg));
+  } catch {
+    showToast("浏览器禁止保存本地设置，请检查站点存储权限");
+    return;
+  }
   turnUrlsInput.value = cfg.urls;
-  localStorage.setItem(APP_CONFIG.turnStorageKey, JSON.stringify(cfg));
   showToast(
     turnCount > 0
       ? `✅ 已保存！识别到 ${turnCount} 个 TURN 中转地址（下次连接生效）`
@@ -396,8 +419,11 @@ function updateProgress(label, transferred, total, force = false) {
 }
 
 function clearTransferState(hideProgress = false) {
+  clearInterval(drainProgressTimer);
+  drainProgressTimer = null;
   isTransferring = false;
   currentTransferId = null;
+  transferStartTime = 0;
   pendingIncomingMeta = null;
   receiveBlobs = [];
   receiveChunks = [];
@@ -424,8 +450,10 @@ function resetIdleTimer() {
 
   idleTimer = setTimeout(() => {
     if (isChannelOpen() && !isTransferring) {
+      const channel = dc;
       sendControl({ type: "idle-timeout" });
       setTimeout(() => {
+        if (dc !== channel) return;
         resetSession("已连续 5 分钟无传输操作，自动断开以保护安全");
         showToast("长时间无传输，已自动断开");
       }, 200);
@@ -456,13 +484,16 @@ async function detectSelectedRoute() {
     let activePair = selectedPairId ? stats.get(selectedPairId) : null;
     if (!activePair) {
       stats.forEach((report) => {
-        if (report.type === "candidate-pair" && (report.selected || report.state === "succeeded")) {
+        if (
+          report.type === "candidate-pair" &&
+          (report.selected === true || (report.nominated === true && report.state === "succeeded"))
+        ) {
           activePair = report;
         }
       });
     }
 
-    if (!activePair) return { label: "", detail: "未读取到选中候选对" };
+    if (!activePair) return { label: "", detail: "未读取到选中候选对", isRelay: false };
     const local = stats.get(activePair.localCandidateId);
     const remote = stats.get(activePair.remoteCandidateId);
     const lType = local?.candidateType || "unknown";
@@ -470,14 +501,12 @@ async function detectSelectedRoute() {
     const detail = `选中候选对: local=${lType}, remote=${rType}`;
 
     if (lType === "relay" || rType === "relay") {
-      return { label: "🔁 TURN 中继转发", detail };
+      return { label: "🔁 TURN 中继转发", detail, isRelay: true };
     }
-    if (lType === "host" && rType === "host") {
-      return { label: "🏠 局域网极速直连", detail };
-    }
-    return { label: "🌐 公网点对点直连", detail };
+    if (!local?.candidateType || !remote?.candidateType) return { label: "", detail, isRelay: false };
+    return { label: "点对点直连", detail, isRelay: false };
   } catch {
-    return { label: "", detail: "读取 getStats 失败" };
+    return { label: "", detail: "读取 getStats 失败", isRelay: false };
   }
 }
 
@@ -487,6 +516,8 @@ function closePeerConnectionOnly() {
   stepTimer = null;
   clearTimeout(disconnectedGraceTimer);
   disconnectedGraceTimer = null;
+  clearTimeout(recoveryTimer);
+  recoveryTimer = null;
   clearIdleTimer();
   clearTransferState(true);
   showVerifyBadge("");
@@ -495,7 +526,9 @@ function closePeerConnectionOnly() {
   remotePeerId = null;
   currentSessionId = null;
   currentIceGen = 0;
+  remoteIceGen = 0;
   iceRestartCount = 0;
+  currentRouteIsRelay = false;
 
   if (dc) {
     dc.onopen = null;
@@ -507,6 +540,7 @@ function closePeerConnectionOnly() {
   }
   if (pc) {
     pc.onicecandidate = null;
+    pc.onicecandidateerror = null;
     pc.ondatachannel = null;
     pc.oniceconnectionstatechange = null;
     pc.onconnectionstatechange = null;
@@ -553,6 +587,7 @@ function setupPeerConnection(targetId, sessionId) {
   currentSessionId = sessionId;
   currentIceGen = 1;
   iceRestartCount = 0;
+  candidateStats = { host: 0, srflx: 0, prflx: 0, relay: 0 };
 
   const rtcCfg = getRtcConfiguration();
   addDiag(`初始化 WebRTC（策略: ${rtcCfg.iceTransportPolicy}，含 TURN: ${rtcCfg.hasTurn ? "是" : "否"}）`);
@@ -561,6 +596,12 @@ function setupPeerConnection(targetId, sessionId) {
     iceServers: rtcCfg.iceServers,
     iceTransportPolicy: rtcCfg.iceTransportPolicy,
   });
+  pc.onicecandidateerror = (event) => {
+    const transport = String(event.url || "").split(":")[0];
+    if (["stun", "turn", "turns"].includes(transport)) {
+      addDiag(`${transport.toUpperCase()} 候选收集错误（${event.errorCode}），其他线路仍可尝试`);
+    }
+  };
 
   pc.onicecandidate = (event) => {
     if (!event.candidate) {
@@ -591,8 +632,15 @@ function setupPeerConnection(targetId, sessionId) {
     addDiag(`ICE 状态变化 -> ${iceState}`);
 
     if (iceState === "connected" || iceState === "completed") {
+      const wasRecovering = Boolean(recoveryTimer || disconnectedGraceTimer);
       clearTimeout(disconnectedGraceTimer);
       disconnectedGraceTimer = null;
+      clearTimeout(recoveryTimer);
+      recoveryTimer = null;
+      if (wasRecovering && isChannelOpen()) {
+        addDiag("网络已恢复");
+        if (!isTransferring) setStatus("ready", "加密通道已连接", true);
+      }
       return;
     }
 
@@ -627,15 +675,19 @@ function setupPeerConnection(targetId, sessionId) {
   stepTimer = setTimeout(() => {
     if (!isChannelOpen()) {
       addDiag(`建连超时（15s），最终本地候选: host=${candidateStats.host}, srflx=${candidateStats.srflx}, relay=${candidateStats.relay}`);
+      const hint = !rtcCfg.hasTurn ? "本机仅尝试直连。跨网连接可在下方配置 TURN 后重试。" :
+        candidateStats.relay === 0 ? "本机未获得中继候选，请检查 TURN 地址、凭据和端口。" :
+        "已获得本地中继候选，但数据通道未打开，请结合对方诊断检查中继线路。";
+      addDiag(hint);
       if (currentRole === "sender") {
         closePeerConnectionOnly();
         pendingGuestId = null;
         createRoomBtn.textContent = "房间已开启，等待对方输入暗号...";
-        setStatus("waiting", `点对点通道建立超时（请展开下方诊断查看候选类型），房间已解锁（暗号：${sendCodeInput.value.trim()}）`, true);
+        setStatus("waiting", `连接超时，房间已解锁。${hint}`, true);
         showToast("本次建连超时，可展开下方诊断查看原因");
       } else {
-        resetSession("点对点通道建立超时（15秒）：可展开下方「连接诊断」查看是否缺少中继或被防火墙拦截");
-        showToast("点对点直连超时");
+        resetSession(`连接超时（15 秒）。${hint}`);
+        showToast("本次连接超时");
       }
     }
   }, APP_CONFIG.webrtcConnectTimeoutMs);
@@ -643,7 +695,12 @@ function setupPeerConnection(targetId, sessionId) {
 
 // 有界执行最多 1 次 restartIce()，仅由发送方发起避免双端冲突
 async function attemptBoundedIceRestart(reason) {
-  if (!pc || !remotePeerId || !currentSessionId) return;
+  if (!pc || !remotePeerId || !currentSessionId || recoveryTimer) return;
+  const peer = pc;
+  recoveryTimer = setTimeout(() => {
+    addDiag("网络恢复超时，结束本次连接");
+    handleChannelLost();
+  }, APP_CONFIG.webrtcConnectTimeoutMs);
 
   if (currentRole === "sender" && iceRestartCount < APP_CONFIG.maxIceRestarts && signal) {
     iceRestartCount++;
@@ -652,8 +709,10 @@ async function attemptBoundedIceRestart(reason) {
     setStatus("waiting", "检测到网络波动，正在尝试重新打通通道...", true);
     try {
       if (typeof pc.restartIce === "function") pc.restartIce();
-      const offer = await pc.createOffer({ iceRestart: true });
-      await pc.setLocalDescription(offer);
+      const offer = await peer.createOffer({ iceRestart: true });
+      if (pc !== peer) return;
+      await peer.setLocalDescription(offer);
+      if (pc !== peer) return;
       sendSignal({
         type: "webrtc-offer",
         to: remotePeerId,
@@ -663,10 +722,11 @@ async function attemptBoundedIceRestart(reason) {
       });
       return;
     } catch {
+      if (pc !== peer) return;
       addDiag("restartIce 重新协商失败");
     }
-  } else if (currentRole === "receiver" && iceRestartCount < APP_CONFIG.maxIceRestarts && isChannelOpen()) {
-    // 接收方给发送方留出接收新 restartIce offer 的短暂窗口
+  } else if (currentRole === "receiver" && signal) {
+    sendSignal({ type: "restart-request", to: remotePeerId, sessionId: currentSessionId, iceGen: currentIceGen });
     addDiag(`${reason}，等待发送方发起 restartIce 恢复...`);
     return;
   }
@@ -686,6 +746,8 @@ function attachDataChannel(channel) {
     addDiag("DataChannel 已打开（open）");
 
     const route = await detectSelectedRoute();
+    if (dc !== channel || !isChannelOpen()) return;
+    currentRouteIsRelay = Boolean(route.isRelay);
     if (route.detail) addDiag(route.detail);
 
     // 导出双方证书指纹短核对码，用于独立确认对端身份
@@ -697,13 +759,13 @@ function attachDataChannel(channel) {
     if (verifyCode) addDiag(`DTLS 证书指纹核对码已生成：${verifyCode}`);
 
     if (currentRole === "sender") {
-      createRoomBtn.textContent = "已与对方加密直连";
-      setStatus("ready", `已建立一对一加密直连 ${route.label ? `｜ ${route.label}` : ""}`, true);
+      createRoomBtn.textContent = "已与对方连接";
+      setStatus("ready", `一对一加密连接 ${route.label ? `｜ ${route.label}` : ""}`, true);
       updateSendControls();
       resetIdleTimer();
       showToast("连接成功！可核对安全码后发送文件或文字");
     } else {
-      setStatus("ready", `已建立一对一加密直连 ${route.label ? `｜ ${route.label}` : "｜ 等待对方发送"}`, true);
+      setStatus("ready", `一对一加密连接 ${route.label ? `｜ ${route.label}` : "｜ 等待对方发送"}`, true);
       resetIdleTimer();
       showToast("配对成功！等待发送方传文件");
     }
@@ -728,7 +790,9 @@ function handleChannelLost() {
   if (!pc && !dc) return;
   const wasTransferring = isTransferring;
 
-  if (currentRole === "sender" && roomActive) {
+  if (currentRole === "sender" && !roomActive) {
+    resetSession("数据通道和房间信令均已断开，请重新创建房间");
+  } else if (currentRole === "sender") {
     closePeerConnectionOnly();
     pendingGuestId = null;
     createRoomBtn.textContent = "房间已开启，等待对方输入暗号...";
@@ -747,29 +811,34 @@ function handleChannelLost() {
 }
 
 async function queueOrAddIce(sessionId, iceGen, candidate) {
-  if (!pc || sessionId !== currentSessionId || iceGen !== currentIceGen) {
+  if (!pc || sessionId !== currentSessionId || !Number.isInteger(iceGen) ||
+      iceGen < currentIceGen || iceGen > currentIceGen + (currentRole === "receiver" ? 1 : 0)) {
     // 严格丢弃上一代或旧会话的迟到 ICE 候选
     return;
   }
   const key = `${sessionId}:${iceGen}`;
-  if (pc.remoteDescription) {
+  if (remoteIceGen === iceGen) {
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch {}
   } else {
     if (!pendingIceMap.has(key)) pendingIceMap.set(key, []);
-    pendingIceMap.get(key).push(candidate);
+    const pending = pendingIceMap.get(key);
+    if (pending.length < 128) pending.push(candidate);
   }
 }
 
 async function flushPendingIce(sessionId, iceGen) {
-  if (!pc || !pc.remoteDescription) return;
+  const peer = pc;
+  if (!peer || sessionId !== currentSessionId || iceGen !== currentIceGen) return;
+  remoteIceGen = iceGen;
   const key = `${sessionId}:${iceGen}`;
   const list = pendingIceMap.get(key) || [];
   pendingIceMap.delete(key);
   for (const cand of list) {
     try {
-      await pc.addIceCandidate(new RTCIceCandidate(cand));
+      if (pc !== peer || iceGen !== currentIceGen) return;
+      await peer.addIceCandidate(new RTCIceCandidate(cand));
     } catch {}
   }
 }
@@ -792,11 +861,14 @@ async function createSenderRoom() {
   resetDiag("发送方开始连接国内信令节点...");
   setStatus("waiting", "正在连接国内信令节点...", true);
 
+  const client = new MqttSignalClient();
+  signal = client;
   try {
-    signal = new MqttSignalClient();
-    const brokerUrl = await signal.connect();
+    const brokerUrl = await client.connect();
+    if (signal !== client) return;
     addDiag(`国内信令已连通（${brokerUrl.replace("wss://", "")}）`);
   } catch {
+    if (signal !== client) return;
     addDiag("国内信令连接失败");
     resetSession("无法连接国内信令节点，请检查网络后重试");
     showToast("连接国内信令失败，请检查网络");
@@ -831,15 +903,18 @@ async function createSenderRoom() {
 
   signal.onClose = () => {
     addDiag("信令 WebSocket 连接关闭");
-    if (currentRole === "sender" && !isChannelOpen()) {
+    roomActive = false;
+    if (!isChannelOpen()) {
       resetSession("与国内信令服务器断开，请重新生成房间");
+    } else {
+      addDiag("已建立的数据通道可继续传输，断开后需重新建房");
     }
   };
 
   signal.subscribe(roomTopic);
   setStatus("waiting", `正在检查暗号「${rawCode}」是否可用...`, true);
 
-  setTimeout(() => sendSignal({ type: "room-probe" }), 120);
+  sendSignal({ type: "room-probe" });
   probeTimer = setTimeout(() => {
     if (occupied || currentRole !== "sender") return;
     roomActive = true;
@@ -858,6 +933,11 @@ async function handleSenderSignal(msg) {
   }
 
   if (msg.type === "join-request") {
+    if (msg.from === remotePeerId) return;
+    if (msg.from === pendingGuestId) {
+      sendSignal({ type: "join-pending", to: pendingGuestId });
+      return;
+    }
     if (remotePeerId || pendingGuestId) {
       sendSignal({
         type: "room-full",
@@ -870,6 +950,13 @@ async function handleSenderSignal(msg) {
     }
 
     pendingGuestId = msg.from;
+    clearTimeout(stepTimer);
+    stepTimer = setTimeout(() => {
+      if (pendingGuestId !== msg.from) return;
+      pendingGuestId = null;
+      connectRequestBox.classList.add("hidden");
+      setStatus("waiting", "连接请求已过期，房间继续等待接收方", true);
+    }, APP_CONFIG.approvalTimeoutMs);
     sendSignal({ type: "join-pending", to: pendingGuestId });
     connectRequestBox.classList.remove("hidden");
     addDiag("收到接收方加入请求，等待手动点击同意");
@@ -878,10 +965,17 @@ async function handleSenderSignal(msg) {
   }
 
   if (msg.type === "join-cancel" && msg.from === pendingGuestId) {
+    clearTimeout(stepTimer);
     pendingGuestId = null;
     connectRequestBox.classList.add("hidden");
     addDiag("接收方取消了连接请求");
     setStatus("waiting", `对方取消了连接，继续等待暗号：${sendCodeInput.value.trim()}`, true);
+    return;
+  }
+
+  if (msg.type === "restart-request" && msg.from === remotePeerId &&
+      msg.sessionId === currentSessionId && msg.iceGen === currentIceGen) {
+    await attemptBoundedIceRestart("接收方请求恢复网络");
     return;
   }
 
@@ -892,8 +986,10 @@ async function handleSenderSignal(msg) {
     msg.iceGen === currentIceGen &&
     pc
   ) {
+    const peer = pc;
     try {
-      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      await peer.setRemoteDescription(msg.sdp);
+      if (pc !== peer || currentIceGen !== msg.iceGen) return;
       addDiag(`收到并设置远端 Answer SDP（代次 #${msg.iceGen}）`);
       await flushPendingIce(msg.sessionId, msg.iceGen);
     } catch {
@@ -918,13 +1014,15 @@ acceptConnBtn.addEventListener("click", async () => {
   const sessionId = "s_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 6);
   addDiag(`已点击同意连接（会话 ${sessionId}）`);
 
-  setupPeerConnection(guestId, sessionId);
-  const channel = pc.createDataChannel("anhao-data", { ordered: true });
-  attachDataChannel(channel);
-
+  let peer;
   try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+    setupPeerConnection(guestId, sessionId);
+    peer = pc;
+    attachDataChannel(peer.createDataChannel("anhao-data", { ordered: true }));
+    const offer = await peer.createOffer();
+    if (pc !== peer) return;
+    await peer.setLocalDescription(offer);
+    if (pc !== peer) return;
     addDiag(`已发送 Offer SDP（代次 #${currentIceGen}）`);
     sendSignal({
       type: "webrtc-offer",
@@ -934,15 +1032,19 @@ acceptConnBtn.addEventListener("click", async () => {
       sdp: pc.localDescription,
     });
   } catch {
+    if (peer && pc !== peer) return;
     addDiag("创建 Offer SDP 失败");
+    sendSignal({ type: "connect-rejected", to: guestId, reason: "发送方无法建立连接，请检查 TURN 设置后重试" });
     closePeerConnectionOnly();
-    setStatus("error", "创建点对点连接失败，请重试", true);
+    setStatus("error", "创建连接失败，请检查 TURN 设置；房间已解锁", true);
   }
 });
 
 rejectConnBtn.addEventListener("click", () => {
   if (!pendingGuestId) return;
   const guestId = pendingGuestId;
+  clearTimeout(stepTimer);
+  stepTimer = null;
   pendingGuestId = null;
   connectRequestBox.classList.add("hidden");
 
@@ -973,11 +1075,14 @@ async function joinReceiverRoom() {
   resetDiag("接收方开始连接国内信令节点...");
   setStatus("waiting", "正在连接国内信令节点...", true);
 
+  const client = new MqttSignalClient();
+  signal = client;
   try {
-    signal = new MqttSignalClient();
-    const brokerUrl = await signal.connect();
+    const brokerUrl = await client.connect();
+    if (signal !== client) return;
     addDiag(`国内信令已连通（${brokerUrl.replace("wss://", "")}）`);
   } catch {
+    if (signal !== client) return;
     addDiag("国内信令连接失败");
     resetSession("无法连接国内信令节点，请检查网络后重试");
     showToast("连接国内信令失败，请检查网络");
@@ -986,12 +1091,15 @@ async function joinReceiverRoom() {
 
   roomTopic = codeToRoomTopic(rawCode);
   let roomFound = false;
+  let hostId = null;
+  const earlyIce = [];
 
   signal.onMessage = async (topic, msg) => {
     if (topic !== roomTopic || !msg || msg.from === myClientId) return;
     if (msg.to && msg.to !== myClientId) return;
 
-    if (msg.type === "room-full") {
+    if (hostId && msg.from !== hostId) return;
+    if (msg.type === "room-full" && !pc) {
       clearTimeout(stepTimer);
       addDiag("房间已满（第 3 人拦截）");
       resetSession(msg.reason || "该暗号房间已满（仅支持一对一传输）");
@@ -999,7 +1107,7 @@ async function joinReceiverRoom() {
       return;
     }
 
-    if (msg.type === "connect-rejected") {
+    if (msg.type === "connect-rejected" && !pc) {
       clearTimeout(stepTimer);
       addDiag("发送方拒绝了连接请求");
       resetSession(msg.reason || "发送方拒绝了你的连接请求");
@@ -1008,6 +1116,8 @@ async function joinReceiverRoom() {
     }
 
     if (msg.type === "join-pending") {
+      if (roomFound) return;
+      hostId = msg.from;
       roomFound = true;
       addDiag("已找到发送方，等待对方点击「同意连接」");
       setStatus("waiting", "已找到发送方！等待对方点击「同意连接」...", true);
@@ -1015,6 +1125,7 @@ async function joinReceiverRoom() {
       stepTimer = setTimeout(() => {
         if (!isChannelOpen()) {
           addDiag("等待对方点击同意超时（60s）");
+          sendSignal({ type: "join-cancel", to: hostId });
           resetSession("等待对方点击「同意连接」超时（60秒），请提醒对方确认");
           showToast("对方长时间未点击同意连接");
         }
@@ -1023,31 +1134,38 @@ async function joinReceiverRoom() {
     }
 
     if (msg.type === "webrtc-offer") {
+      if (!msg.from || msg.to !== myClientId) return;
       roomFound = true;
+      hostId = msg.from;
       const incomingSessionId = msg.sessionId || "s_legacy";
       const incomingIceGen = Number(msg.iceGen) || 1;
 
-      // 若是同一会话的 restartIce 新代次 offer，在现有 pc 上直接重新协商
-      if (pc && currentSessionId === incomingSessionId && incomingIceGen > currentIceGen) {
-        currentIceGen = incomingIceGen;
-        addDiag(`收到发送方 restartIce Offer（代次 #${currentIceGen}）`);
-      } else {
-        addDiag(`收到发送方同意与 Offer SDP（会话 ${incomingSessionId}，代次 #${incomingIceGen}）`);
-        setStatus("waiting", "对方已同意！正在打通点对点加密通道...", true);
-        setupPeerConnection(msg.from, incomingSessionId);
-        currentIceGen = incomingIceGen;
-
-        pc.ondatachannel = (event) => {
-          attachDataChannel(event.channel);
-        };
-      }
-
+      if (pc && (currentSessionId !== incomingSessionId || incomingIceGen !== currentIceGen + 1)) return;
+      let peer;
       try {
-        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        if (pc) {
+          currentIceGen = incomingIceGen;
+          addDiag(`收到发送方 restartIce Offer（代次 #${currentIceGen}）`);
+        } else {
+          addDiag(`收到发送方同意与 Offer SDP（会话 ${incomingSessionId}，代次 #${incomingIceGen}）`);
+          setStatus("waiting", "对方已同意！正在建立加密通道...", true);
+          setupPeerConnection(msg.from, incomingSessionId);
+          currentIceGen = incomingIceGen;
+          pendingIceMap.set(`${incomingSessionId}:${incomingIceGen}`, earlyIce.splice(0)
+            .filter(item => item.sessionId === incomingSessionId && item.iceGen === incomingIceGen)
+            .map(item => item.candidate));
+          pc.ondatachannel = (event) => attachDataChannel(event.channel);
+        }
+
+        peer = pc;
+        await peer.setRemoteDescription(msg.sdp);
+        if (pc !== peer || currentIceGen !== incomingIceGen) return;
         addDiag(`远端 Offer SDP 设置完成（代次 #${currentIceGen}）`);
         await flushPendingIce(incomingSessionId, incomingIceGen);
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        const answer = await peer.createAnswer();
+        if (pc !== peer || currentIceGen !== incomingIceGen) return;
+        await peer.setLocalDescription(answer);
+        if (pc !== peer || currentIceGen !== incomingIceGen) return;
         addDiag(`已回复 Answer SDP（代次 #${currentIceGen}）`);
         sendSignal({
           type: "webrtc-answer",
@@ -1057,14 +1175,16 @@ async function joinReceiverRoom() {
           sdp: pc.localDescription,
         });
       } catch {
+        if (peer && pc !== peer) return;
         addDiag("处理 Offer / 创建 Answer 失败");
-        resetSession("建立点对点应答失败，请重试");
+        resetSession("建立连接失败，请检查 TURN 配置或重新加入房间");
       }
       return;
     }
 
-    if (msg.type === "webrtc-ice" && msg.from === remotePeerId && msg.candidate) {
-      await queueOrAddIce(msg.sessionId, msg.iceGen, msg.candidate);
+    if (msg.type === "webrtc-ice" && msg.to === myClientId && msg.candidate) {
+      if (!pc && hostId && earlyIce.length < 128) earlyIce.push(msg);
+      else if (msg.from === remotePeerId) await queueOrAddIce(msg.sessionId, msg.iceGen, msg.candidate);
     }
   };
 
@@ -1078,11 +1198,9 @@ async function joinReceiverRoom() {
   signal.subscribe(roomTopic);
   setStatus("waiting", `正在寻找暗号「${rawCode}」对应的发送方...`, true);
 
+  sendSignal({ type: "join-request" });
   setTimeout(() => {
-    if (currentRole === "receiver" && !roomFound) sendSignal({ type: "join-request" });
-  }, 150);
-  setTimeout(() => {
-    if (currentRole === "receiver" && !roomFound) sendSignal({ type: "join-request" });
+    if (signal === client && !roomFound) sendSignal({ type: "join-request" });
   }, 1200);
 
   stepTimer = setTimeout(() => {
@@ -1094,9 +1212,10 @@ async function joinReceiverRoom() {
   }, APP_CONFIG.findRoomTimeoutMs);
 }
 
-// ==================== 文件分片高速流控发送（2MB 双缓冲 + 16KB 零拷贝） ====================
+// ==================== 文件分片发送（双缓冲预读与背压流控） ====================
 
 function waitForBufferDrain(onTick) {
+  const channel = dc;
   return new Promise((resolve, reject) => {
     if (!isChannelOpen()) {
       reject(new Error("连接已断开"));
@@ -1111,10 +1230,8 @@ function waitForBufferDrain(onTick) {
 
     let settled = false;
     const cleanup = () => {
-      if (dc) {
-        dc.removeEventListener("bufferedamountlow", onLow);
-        dc.removeEventListener("close", onClose);
-      }
+      channel.removeEventListener("bufferedamountlow", onLow);
+      channel.removeEventListener("close", onClose);
       clearInterval(fallbackTimer);
     };
 
@@ -1136,7 +1253,7 @@ function waitForBufferDrain(onTick) {
     dc.addEventListener("close", onClose);
 
     const fallbackTimer = setInterval(() => {
-      if (!isChannelOpen()) {
+      if (dc !== channel || channel.readyState !== "open") {
         onClose();
       } else {
         if (onTick) onTick();
@@ -1169,16 +1286,19 @@ function offerFileToReceiver() {
 }
 
 async function startSendingFileChunks(transferId) {
-  if (!selectedFile || !isChannelOpen() || transferId !== currentTransferId) return;
+  if (!selectedFile || !isChannelOpen() || !isTransferring || transferStartTime || transferId !== currentTransferId) return;
 
   const file = selectedFile;
-  const chunkSize = APP_CONFIG.chunkSize;
+  // 直连时最高用 64KB，走 TURN 中继时收敛到最稳的 16KB，并加安全下限保护
+  const maxAllowedChunk = currentRouteIsRelay ? 16 * 1024 : APP_CONFIG.chunkSize;
+  const negotiatedMax = pc.sctp?.maxMessageSize || 16 * 1024;
+  const chunkSize = Math.max(4096, Math.min(maxAllowedChunk, negotiatedMax));
   transferStartTime = performance.now();
   lastSpeedTime = transferStartTime;
   lastSpeedBytes = 0;
   currentSpeedBps = 0;
 
-  setStatus("ready", `正在高速加密直连发送：${file.name}（请勿关闭页面）`, true);
+  setStatus("ready", `正在加密发送：${file.name}（请勿关闭页面）`, true);
   updateProgress("发送中", 0, file.size, true);
 
   let readOffset = 0;
@@ -1211,6 +1331,7 @@ async function startSendingFileChunks(transferId) {
             const realSent = Math.max(0, sentOffset - (dc ? dc.bufferedAmount : 0));
             updateProgress("发送中", realSent, file.size);
           });
+          if (!isChannelOpen() || transferId !== currentTransferId) return;
         }
 
         const len = Math.min(chunkSize, batchBuffer.byteLength - pos);
@@ -1229,10 +1350,28 @@ async function startSendingFileChunks(transferId) {
       transferId,
       totalBytes: file.size,
     });
-    const finalSent = Math.max(0, sentOffset - (dc ? dc.bufferedAmount : 0));
-    updateProgress("等待对方接收完成", finalSent, file.size, true);
+    const refreshTailDrain = () => {
+      if (!isTransferring || transferId !== currentTransferId || !isChannelOpen()) {
+        clearInterval(drainProgressTimer);
+        drainProgressTimer = null;
+        return;
+      }
+      const buffered = dc.bufferedAmount;
+      const realSent = Math.max(0, sentOffset - buffered);
+      updateProgress(buffered > 0 ? "发送中" : "等待对方校验完成", realSent, file.size, true);
+      if (buffered === 0) {
+        clearInterval(drainProgressTimer);
+        drainProgressTimer = null;
+      }
+    };
+    refreshTailDrain();
+    clearInterval(drainProgressTimer);
+    if (dc && dc.bufferedAmount > 0) {
+      drainProgressTimer = setInterval(refreshTailDrain, 100);
+    }
   } catch (err) {
-    if (isTransferring) {
+    if (isTransferring && transferId === currentTransferId) {
+      if (isChannelOpen()) sendControl({ type: "file-error", transferId });
       clearTransferState(true);
       const reason = err && err.message ? `（${err.message}）` : "";
       setStatus("error", `文件发送中断${reason}，请确认双方网络正常后重试`, true);
@@ -1281,25 +1420,21 @@ function compactReceiveChunksIfNeeded(force = false) {
 }
 
 function handleChannelMessage(rawData) {
-  if (rawData instanceof ArrayBuffer || ArrayBuffer.isView(rawData)) {
+  if (rawData instanceof ArrayBuffer || ArrayBuffer.isView(rawData) || rawData instanceof Blob) {
     if (currentRole !== "receiver" || !isTransferring || !pendingIncomingMeta) return;
+    const bytes = rawData instanceof Blob ? rawData.size : rawData.byteLength;
+    if (receivedBytes + bytes > pendingIncomingMeta.size) {
+      sendControl({ type: "file-error", transferId: pendingIncomingMeta.transferId });
+      clearTransferState(true);
+      setStatus("error", "收到的数据超过已确认的文件大小，已停止接收", true);
+      resetIdleTimer();
+      return;
+    }
     receiveChunks.push(rawData);
-    receiveChunkBytes += rawData.byteLength;
-    receivedBytes += rawData.byteLength;
+    receiveChunkBytes += bytes;
+    receivedBytes += bytes;
     compactReceiveChunksIfNeeded(false);
     updateProgress("接收中", receivedBytes, pendingIncomingMeta.size);
-    return;
-  }
-
-  if (rawData instanceof Blob) {
-    if (currentRole !== "receiver" || !isTransferring || !pendingIncomingMeta) return;
-    rawData.arrayBuffer().then((buf) => {
-      receiveChunks.push(buf);
-      receiveChunkBytes += buf.byteLength;
-      receivedBytes += buf.byteLength;
-      compactReceiveChunksIfNeeded(false);
-      updateProgress("接收中", receivedBytes, pendingIncomingMeta.size);
-    });
     return;
   }
 
@@ -1333,10 +1468,12 @@ function handleChannelMessage(rawData) {
   }
 
   if (data.type === "file-offer" && currentRole === "receiver") {
+    if (!data.transferId || typeof data.transferId !== "string" ||
+        !Number.isSafeInteger(data.size) || data.size < 0 || pendingIncomingMeta) return;
     pendingIncomingMeta = {
       transferId: data.transferId,
       name: String(data.name || "未命名文件"),
-      size: Number(data.size) || 0,
+      size: data.size,
       mime: String(data.mime || "application/octet-stream"),
     };
     incomingFileName.textContent = pendingIncomingMeta.name;
@@ -1352,6 +1489,7 @@ function handleChannelMessage(rawData) {
     return;
   }
 
+  if (currentRole === "sender" && (!currentTransferId || data.transferId !== currentTransferId)) return;
   if (data.type === "file-accept" && currentRole === "sender") {
     startSendingFileChunks(data.transferId);
     return;
@@ -1366,15 +1504,16 @@ function handleChannelMessage(rawData) {
   }
 
   if (data.type === "file-end" && currentRole === "receiver") {
-    if (!pendingIncomingMeta || data.transferId !== pendingIncomingMeta.transferId) return;
+    if (!isTransferring || !pendingIncomingMeta || data.transferId !== pendingIncomingMeta.transferId) return;
 
     const expectedSize = pendingIncomingMeta.size;
     const fileName = pendingIncomingMeta.name;
     const fileMime = pendingIncomingMeta.mime;
 
     if (receivedBytes !== expectedSize) {
+      const actualSize = receivedBytes;
       clearTransferState(true);
-      setStatus("error", `文件校验失败（预期 ${expectedSize} 字节，实收 ${receivedBytes} 字节），已清理损坏缓存`, true);
+      setStatus("error", `文件校验失败（预期 ${expectedSize} 字节，实收 ${actualSize} 字节），已清理损坏缓存`, true);
       showToast("文件不完整，已拒绝保存，请让对方重发");
       sendControl({ type: "file-error", transferId: data.transferId });
       resetIdleTimer();
@@ -1404,16 +1543,17 @@ function handleChannelMessage(rawData) {
     return;
   }
 
-  if (data.type === "file-error" && currentRole === "sender") {
+  if (data.type === "file-error" && (currentRole === "sender" ||
+      (pendingIncomingMeta && pendingIncomingMeta.transferId === data.transferId))) {
     clearTransferState(true);
-    setStatus("error", "对方校验文件不完整，请重新点击发送", true);
-    showToast("对方校验未通过，请重发");
+    setStatus("error", "文件传输未完成，请重新发送", true);
+    showToast("文件传输已中止");
     resetIdleTimer();
   }
 }
 
 acceptFileBtn.addEventListener("click", () => {
-  if (!isChannelOpen() || !pendingIncomingMeta) return;
+  if (!isChannelOpen() || !pendingIncomingMeta || isTransferring) return;
 
   isTransferring = true;
   clearIdleTimer();
@@ -1427,7 +1567,7 @@ acceptFileBtn.addEventListener("click", () => {
   currentSpeedBps = 0;
   incomingBox.classList.add("hidden");
 
-  setStatus("ready", `正在高速加密直连接收：${pendingIncomingMeta.name}（请勿关闭页面）`, true);
+  setStatus("ready", `正在加密接收：${pendingIncomingMeta.name}（请勿关闭页面）`, true);
   updateProgress("接收中", 0, pendingIncomingMeta.size, true);
 
   sendControl({
@@ -1509,6 +1649,10 @@ copyCodeBtn.addEventListener("click", async () => {
 
 function handleFileSelected(file) {
   if (!file) return;
+  if (isTransferring) {
+    showToast("请在当前文件传输结束后再选择文件");
+    return;
+  }
   selectedFile = file;
   selectedFileName.textContent = file.name;
   selectedFileSize.textContent = formatBytes(file.size);

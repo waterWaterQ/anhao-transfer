@@ -14,7 +14,7 @@
         <span class="brand-logo" aria-hidden="true">⚡</span>
         <div>
           <h1 id="app-title">暗号快传</h1>
-          <p class="brand-desc">点对点直连 · 不限速 · 不经网盘</p>
+          <p class="brand-desc">优先点对点直连 · 免登录 · 不经网盘</p>
         </div>
       </div>
       <button id="theme-toggle" class="icon-btn" type="button" title="切换浅色/深色主题">
@@ -37,8 +37,8 @@
       <!-- 连接状态提示条 -->
       <div id="status-bar" class="status-bar status-idle">
         <span class="status-dot"></span>
-        <span id="status-text">未连接：请创建暗号房间或输入对方暗号</span>
-        <span id="verify-badge" class="verify-badge hidden" title="由双方 WebRTC 加密证书指纹实时导出，核对一致即确保无中间人"></span>
+        <span id="status-text" role="status">未连接：请创建暗号房间或输入对方暗号</span>
+        <span id="verify-badge" class="verify-badge hidden" title="请通过电话或已有聊天核对双方显示的安全码"></span>
         <button id="btn-disconnect" class="btn btn-small hidden" type="button">断开</button>
       </div>
 
@@ -58,7 +58,7 @@
             <button id="btn-random-code" class="btn btn-secondary" type="button">🎲 换一个</button>
             <button id="btn-copy-code" class="btn btn-secondary" type="button">📋 复制</button>
           </div>
-          <p class="hint">将暗号告诉对方，对方输入后需你手动同意才会建立一对一加密直连。</p>
+          <p class="hint">将暗号告诉对方。对方输入后，需你手动同意才会建立一对一加密连接。</p>
           <button id="btn-create-room" class="btn btn-primary btn-full" type="button">
             生成房间并等待对方连接
           </button>
@@ -177,17 +177,19 @@
 
           <!-- 自带 TURN 配置入口（仅存在本地浏览器） -->
           <div class="turn-config">
-            <p class="diag-title">🔁 自带 TURN 中转配置（留空则纯 P2P 直连）</p>
+            <p class="diag-title">🔁 自带 TURN 中继</p>
+            <p class="hint">留空时仅尝试直连。跨网连接超时时，可填写自己的中继地址和凭据。设置保存在此浏览器，下次连接生效。</p>
             <input
               id="turn-urls-input"
               class="small-input"
               type="text"
               placeholder="例如：turn:your-domain.com:3478 或 turns:your-domain.com:443?transport=tcp"
+              aria-label="TURN 地址，可用空格分隔多个地址"
               autocomplete="off"
             />
             <div class="turn-cred-row">
-              <input id="turn-user-input" class="small-input" type="text" placeholder="用户名（可选）" autocomplete="off" />
-              <input id="turn-pass-input" class="small-input" type="password" placeholder="凭据/密码（可选）" autocomplete="off" />
+              <input id="turn-user-input" class="small-input" type="text" aria-label="TURN 用户名" placeholder="TURN 用户名" autocomplete="off" />
+              <input id="turn-pass-input" class="small-input" type="password" aria-label="TURN 密码" placeholder="TURN 密码" autocomplete="off" />
             </div>
             <div class="turn-policy-row">
               <label class="hint" for="ice-policy-select">选路策略：</label>
@@ -206,7 +208,7 @@
     <!-- 底部开源与隐私须知 -->
     <footer class="notice-footer">
       <p>
-        🔒 <strong>隐私与使用须知</strong>：文件通过 WebRTC 端到端加密点对点直连，<strong>不经过也不存储在任何服务器</strong>。传输期间需双方保持网页打开；因点对点直连特性，双方网络 IP 彼此可见，建议用于熟人或自有设备间互传。
+        🔒 <strong>隐私与使用须知</strong>：文件与文字通过 WebRTC 端到端加密传输。直连时数据直接到达对方，走 TURN 时由中继转发密文。本工具不在服务器保存文件。双方需同时在线，直连时通信方可见彼此的网络 IP，建议用于熟人或自有设备间互传。
       </p>
     </footer>
   </div>
@@ -215,7 +217,7 @@
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <!-- 纯国内零第三方依赖信令与原生 WebRTC 传输引擎 -->
-  <script src="signal.js?v=14"></script>
-  <script src="app.js?v=14"></script>
+  <script src="signal.js?v=15"></script>
+  <script src="app.js?v=15"></script>
 </body>
 </html>
